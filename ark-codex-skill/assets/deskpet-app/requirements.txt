@@ -1,0 +1,2 @@
+# Daily runtime only; processing/export tools use a separate environment.
+PySide6-Essentials==6.11.2

@@ -1,14 +1,15 @@
-import atexit
+import bisect
 import ctypes
+import math
 import json
 import os
 import random
 import sys
 import time
-import winreg
 from ctypes import wintypes
+from collections import OrderedDict
 
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -17,6 +18,7 @@ from PySide6.QtGui import (
     QGuiApplication,
     QImage,
     QPainter,
+    QRegion,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -32,9 +34,12 @@ from PySide6.QtWidgets import (
     QSlider,
     QVBoxLayout,
     QWidget,
+    QToolTip,
 )
 
+import autostart_support
 import codex_monitor
+from process_support import InstanceGuard, atomic_json, log, remove_identity, write_identity
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PETS_DIR = os.path.join(BASE_DIR, "pets")
@@ -50,6 +55,9 @@ PYW_PATH = os.path.join(BASE_DIR, ".venv", "Scripts", "pythonw.exe")
 
 PAD = 12
 STATUS_H = 46
+STATUS_BAR_MIN_W = 220
+STATUS_BAR_FULL_W = 720
+POSITION_FORMAT = "pet_bottom_center_v1"
 MIN_SCALE = 0.3
 MAX_SCALE = 2.0
 
@@ -96,6 +104,9 @@ DEFAULT_SETTINGS = {
     "pet": None,
     "pet_states": {},
     "autostart_with_codex": False,
+    "playback_fps": 60,
+    "roaming_enabled": False,
+    "roaming_speed": 30,
 }
 
 
@@ -110,11 +121,7 @@ def load_settings():
 
 
 def save_settings(data):
-    tmp = SETTINGS_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, SETTINGS_PATH)
-
+    atomic_json(SETTINGS_PATH, data)
 
 def list_pets():
     pets = []
@@ -136,11 +143,12 @@ def resolve_active_pet(settings):
 
 _initial_settings = load_settings()
 ACTIVE_PET = resolve_active_pet(_initial_settings)
-FRAMES_DIR = os.path.join(PETS_DIR, ACTIVE_PET, "frames")
-MANIFEST_PATH = os.path.join(PETS_DIR, ACTIVE_PET, "manifest.json")
-
-with open(MANIFEST_PATH, encoding="utf-8") as f:
-    MANIFEST = json.load(f)
+FRAMES_DIR = os.path.join(PETS_DIR, ACTIVE_PET, "frames") if ACTIVE_PET else ""
+MANIFEST_PATH = os.path.join(PETS_DIR, ACTIVE_PET, "manifest.json") if ACTIVE_PET else ""
+MANIFEST = {"fps": 60, "size": 1000, "states": {}}
+if ACTIVE_PET:
+    with open(MANIFEST_PATH, encoding="utf-8") as f:
+        MANIFEST = json.load(f)
 
 FPS = int(MANIFEST["fps"])
 
@@ -156,10 +164,6 @@ def switch_pet(name):
         MANIFEST = json.load(f)
     FPS = int(MANIFEST["fps"])
     return True
-
-
-RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_VALUE_NAME = "CodexDeskpetWatcher"
 
 
 def legacy_startup_entry_path():
@@ -182,36 +186,7 @@ def set_autostart(enabled):
             os.remove(legacy)
     except OSError:
         pass
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            RUN_KEY_PATH,
-            0,
-            winreg.KEY_SET_VALUE,
-        )
-        try:
-            if enabled:
-                command = f'"{PYW_PATH}" "{WATCHER_PATH}"'
-                winreg.SetValueEx(
-                    key, RUN_VALUE_NAME, 0, winreg.REG_SZ, command
-                )
-            else:
-                try:
-                    winreg.DeleteValue(key, RUN_VALUE_NAME)
-                except FileNotFoundError:
-                    pass
-        finally:
-            winreg.CloseKey(key)
-    except OSError:
-        return False
-    return True
-
-
-def remove_pid_file():
-    try:
-        os.remove(PID_FILE)
-    except OSError:
-        pass
+    return autostart_support.set_autostart(enabled)
 
 
 def remove_disabled_flag():
@@ -285,10 +260,24 @@ class SettingsDialog(QDialog):
         bar_layout.addWidget(self.bar_slider, 1)
         bar_layout.addWidget(self.bar_value)
 
+        self.fps_combo = QComboBox()
+        for fps in (20, 30, 60):
+            self.fps_combo.addItem(f"{fps} 帧/秒", fps)
+        fps_value = settings.get("playback_fps", 60)
+        self.fps_combo.setCurrentIndex((20, 30, 60).index(fps_value) if fps_value in (20, 30, 60) else 2)
+        self.roam_check = QCheckBox("自动漫游")
+        self.roam_check.setChecked(bool(settings.get("roaming_enabled", False)))
+        self.roam_speed = QSlider(Qt.Horizontal)
+        self.roam_speed.setRange(10, 100)
+        self.roam_speed.setValue(int(settings.get("roaming_speed", 30)))
+        self.roam_speed.setToolTip("漫游速度：每秒 10–100 个逻辑像素")
+        form.addRow("播放帧率上限", self.fps_combo)
+        form.addRow("", self.roam_check)
+        form.addRow("漫游速度", self.roam_speed)
         form.addRow("动作倍速", self.speed_combo)
         form.addRow("字幕长度", self.subtitle_combo)
         form.addRow("字幕大小", size_row)
-        form.addRow("字条长度", bar_row)
+        form.addRow("字幕条宽度", bar_row)
         form.addRow("", self.mini_check)
         form.addRow("", self.fullscreen_check)
         form.addRow("", self.autostart_check)
@@ -314,6 +303,9 @@ class SettingsDialog(QDialog):
     def values(self):
         return {
             "speed": self.speed_combo.currentData(),
+            "playback_fps": self.fps_combo.currentData(),
+            "roaming_enabled": self.roam_check.isChecked(),
+            "roaming_speed": self.roam_speed.value(),
             "subtitle_length": self.subtitle_combo.currentData(),
             "subtitle_size": self.size_slider.value(),
             "bar_length": self.bar_slider.value(),
@@ -321,6 +313,18 @@ class SettingsDialog(QDialog):
             "auto_hide_fullscreen": self.fullscreen_check.isChecked(),
             "autostart_with_codex": self.autostart_check.isChecked(),
         }
+
+
+class StatusWorker(QThread):
+    ready = Signal(object)
+
+    def run(self):
+        while not self.isInterruptionRequested():
+            try:
+                self.ready.emit(codex_monitor.get_codex_status())
+            except Exception as exc:
+                log("monitor", str(exc))
+            self.msleep(1000)
 
 
 class PetWindow(QWidget):
@@ -367,10 +371,32 @@ class PetWindow(QWidget):
                 ),
             ),
         )
-        self.cache = {}
+        self.cache = OrderedDict()
+        self.cache_bytes = 0
+        self.render_scale = self.scale
+        self.playback_fps = int(self.settings.get("playback_fps", 60))
+        if self.playback_fps not in (20, 30, 60):
+            self.playback_fps = 60
+        self.roaming_enabled = bool(self.settings.get("roaming_enabled", False))
+        self.roaming_speed = max(10, min(100, int(self.settings.get("roaming_speed", 30))))
+        self.roam_direction = (0, 0)
+        self.roam_until = 0
+        self.next_roam_at = time.monotonic() + random.uniform(3, 6)
+        self.roam_fraction = [0.0, 0.0]
+        self.last_tick = time.monotonic()
+        self.last_activity = self.last_tick
+        self.auto_sit_after = random.uniform(40, 60)
+        self.manual_state = False
+        self.anim_started_at = self.last_tick
+        self.cached_status = {}
+        self.full_status_text = ""
+        self.missing_frames = set()
         self.drag = False
+        self.menu_open = False
+        self._applying_geometry = False
         self.pre_drag_state = "idle"
         self.pre_drag_hold = False
+        self.pre_drag_manual = False
         self.hold_state = False
         self.press_global = None
         self.press_window = None
@@ -380,21 +406,10 @@ class PetWindow(QWidget):
         self.tray_hidden = False
 
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.setInterval(self.tick_ms())
         self.timer.timeout.connect(self.next_frame)
         self.timer.start()
-
-        self.sit_timer = QTimer(self)
-        self.sit_timer.setSingleShot(True)
-        self.sit_timer.timeout.connect(
-            lambda: self.set_state("sit", hold=True)
-        )
-
-        self.sleep_timer = QTimer(self)
-        self.sleep_timer.setSingleShot(True)
-        self.sleep_timer.timeout.connect(
-            lambda: self.set_state("sleep", hold=True)
-        )
 
         self.status_timer = QTimer(self)
         self.status_timer.setInterval(2000)
@@ -407,130 +422,305 @@ class PetWindow(QWidget):
         self.fullscreen_timer.start()
 
         self.set_state("idle")
-        screen = QGuiApplication.primaryScreen().availableGeometry()
-        pos_x = pet_state.get("pos_x")
-        if pos_x is None:
-            pos_x = self.settings.get("pos_x")
-        pos_y = pet_state.get("pos_y")
-        if pos_y is None:
-            pos_y = self.settings.get("pos_y")
-        if pos_x is not None and pos_y is not None:
-            pos_x = int(pos_x)
-            pos_y = int(pos_y)
-            pos_x = max(
-                screen.x() - self.width() + 60,
-                min(pos_x, screen.x() + screen.width() - 60),
-            )
-            pos_y = max(
-                screen.y() - self.height() + 60,
-                min(pos_y, screen.y() + screen.height() - 60),
-            )
-            self.move(pos_x, pos_y)
-        else:
-            self.move(
-                screen.x() + (screen.width() - self.width()) // 2,
-                screen.y() + screen.height() - self.height(),
-            )
+        self.restore_position(pet_state)
+        self.save_pet_state()
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self.save_position)
         self.refresh_status()
         self.show()
+        self.status_worker = StatusWorker(self)
+        self.status_worker.ready.connect(self.receive_status)
+        self.status_worker.start()
+        if app is not None:
+            app.aboutToQuit.connect(self.stop_worker)
+            app.screenAdded.connect(self.connect_screen)
+            app.screenRemoved.connect(self.screen_changed)
+            for display in app.screens():
+                self.connect_screen(display)
+        if self.windowHandle():
+            self.windowHandle().screenChanged.connect(self.screen_changed)
+
+    def stop_worker(self):
+        self.status_worker.requestInterruption()
+        self.status_worker.wait(5000)
+
+    def connect_screen(self, display):
+        display.availableGeometryChanged.connect(self.screen_changed)
+        display.geometryChanged.connect(self.screen_changed)
+        display.logicalDotsPerInchChanged.connect(self.screen_changed)
+        self.screen_changed()
+
+    def screen_changed(self, *args):
+        self.apply_geometry()
+        self.update()
 
     def tick_ms(self):
-        return max(10, int(round(1000 / FPS / self.speed)))
+        return max(8, round(1000 / self.playback_fps))
 
     def state_info(self, name):
         return MANIFEST["states"][name]
 
-    def apply_geometry(self):
-        info = self.state_info(self.state)
-        old_x, old_y = self.x(), self.y()
-        old_w, old_h = self.width(), self.height()
-        bx, by, bx2, by2 = info["bbox"]
-        width = int((bx2 - bx + 1) * self.scale) + PAD * 2
+    def layout_screen(self):
+        point = QPoint(int(self.x() + self.width() / 2), int(self.y() + self.height() / 2))
+        return QGuiApplication.screenAt(point) or QGuiApplication.primaryScreen()
+
+    def status_bar_width(self, screen=None):
+        screen = screen or self.layout_screen()
+        available = screen.availableGeometry().width() if screen else STATUS_BAR_FULL_W
+        full_width = min(STATUS_BAR_FULL_W, max(120, available - 24))
+        return min(full_width, max(min(STATUS_BAR_MIN_W, full_width), int(full_width * self.bar_length / 100)))
+
+    def pet_only_window_size(self):
+        bx, by, bx2, by2 = self.state_info(self.state)["bbox"]
         status_extra = STATUS_H if self.show_status else 0
-        height = int((by2 - by + 1) * self.scale) + PAD * 2 + status_extra
-        self.resize(width, height)
-        bottom_center_x = old_x + old_w / 2
-        bottom_y = old_y + old_h
-        self.move(
-            int(bottom_center_x - width / 2),
-            int(bottom_y - height),
+        return (
+            int((bx2 - bx + 1) * self.scale) + PAD * 2,
+            int((by2 - by + 1) * self.scale) + PAD * 2 + status_extra,
         )
 
-    def set_state(self, name, hold=False):
+    def constrain_to_screen(self, screen=None):
+        if screen is None:
+            center = QPoint(
+                int(self.x() + self.width() / 2),
+                int(self.y() + self.height() / 2),
+            )
+            screen = (
+                QGuiApplication.screenAt(center)
+                or QGuiApplication.primaryScreen()
+            )
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        max_x = area.x() + max(0, area.width() - self.width())
+        max_y = area.y() + max(0, area.height() - self.height())
+        self.move(
+            max(area.x(), min(self.x(), max_x)),
+            max(area.y(), min(self.y(), max_y)),
+        )
+
+    def restore_position(self, pet_state):
+        anchor_x = pet_state.get("anchor_x")
+        anchor_y = pet_state.get("anchor_y")
+        if anchor_x is None or anchor_y is None:
+            pos_x = pet_state.get("pos_x")
+            pos_y = pet_state.get("pos_y")
+            if pos_x is None:
+                pos_x = self.settings.get("pos_x")
+            if pos_y is None:
+                pos_y = self.settings.get("pos_y")
+            if pos_x is not None and pos_y is not None:
+                legacy_width, legacy_height = self.pet_only_window_size()
+                anchor_x = float(pos_x) + legacy_width / 2
+                anchor_y = float(pos_y) + legacy_height
+
+        if anchor_x is not None and anchor_y is not None:
+            anchor_point = QPoint(int(anchor_x), int(anchor_y))
+            screen = (
+                QGuiApplication.screenAt(anchor_point)
+                or QGuiApplication.primaryScreen()
+            )
+            self.move(
+                int(float(anchor_x) - self.width() / 2),
+                int(float(anchor_y) - self.height()),
+            )
+            self.apply_geometry(screen=screen)
+            return
+
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        self.move(
+            area.x() + (area.width() - self.width()) // 2,
+            area.y() + area.height() - self.height(),
+        )
+
+    def apply_geometry(self, screen=None):
+        if self._applying_geometry:
+            return
+        self._applying_geometry = True
+        try:
+            self._apply_geometry(screen)
+        finally:
+            self._applying_geometry = False
+
+    def _apply_geometry(self, screen=None):
+        old_center = self.x() + self.width() / 2
+        old_bottom = self.y() + self.height()
+        screen = screen or self.layout_screen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        bx, by, bx2, by2 = self.state_info(self.state)["bbox"]
+        status_extra = STATUS_H if self.show_status else 0
+        self.render_scale = min(
+            self.scale,
+            (area.width() - PAD * 2) / (bx2 - bx + 1),
+            (area.height() - PAD * 2 - status_extra) / (by2 - by + 1),
+        )
+        pet_width = math.ceil((bx2 - bx + 1) * self.render_scale)
+        pet_height = math.ceil((by2 - by + 1) * self.render_scale)
+        width = max(pet_width + PAD * 2, self.status_bar_width(screen) + 12 if self.show_status else 0)
+        height = pet_height + PAD * 2 + status_extra
+        self.resize(width, height)
+        self.move(round(old_center - width / 2), round(old_bottom - height))
+        self.constrain_to_screen(screen)
+        pet_left = (width - pet_width) // 2
+        region = QRegion(QRect(pet_left - 3, status_extra + PAD - 3, pet_width + 6, pet_height + 6))
+        if self.show_status:
+            bar_width = self.status_bar_width(screen)
+            region |= QRegion(QRect((width - bar_width) // 2, 4, bar_width, STATUS_H - 8))
+        self.setMask(region)
+
+    def note_activity(self):
+        self.last_activity = time.monotonic()
+        self.auto_sit_after = random.uniform(40, 60)
+        self.manual_state = False
+        self.next_roam_at = self.last_activity + random.uniform(3, 6)
+
+    def set_state(self, name, hold=False, manual=False):
         if name not in MANIFEST["states"]:
             return
         self.state = name
         self.hold_state = hold
+        self.manual_state = manual
         self.frame_index = 0
+        self.anim_started_at = time.monotonic()
         self.cache.clear()
+        self.cache_bytes = 0
+        if name != "move":
+            self.roam_direction = (0, 0)
         self.apply_geometry()
-        self.schedule_idle()
         self.update()
 
-    def schedule_idle(self):
-        self.sit_timer.stop()
-        self.sleep_timer.stop()
-        if self.state == "sleep":
+    def duration_ms(self):
+        info = self.state_info(self.state)
+        return max(1, info.get("duration", info["count"] * 1000 / FPS))
+
+    def stop_roaming(self):
+        if self.roam_direction != (0, 0):
+            self.roam_direction = (0, 0)
+            self.set_state("idle")
+        self.next_roam_at = time.monotonic() + random.uniform(2, 5)
+
+    def step_roaming(self, now, delta):
+        if not self.roaming_enabled or self.drag or self.menu_open or self.press_global is not None or self.manual_state or not self.isVisible():
             return
-        self.sit_timer.start(40000 + random.randint(0, 20000))
-        self.sleep_timer.start(90000)
+        if self.state not in ("idle", "move"):
+            return
+        if self.roam_direction == (0, 0):
+            if now < self.next_roam_at:
+                return
+            angle = random.uniform(0, math.tau)
+            self.roam_direction = (math.cos(angle), math.sin(angle) * 0.35)
+            self.roam_until = now + random.uniform(3, 6)
+            self.roam_fraction = [0.0, 0.0]
+            self.set_state("move")
+        if now >= self.roam_until:
+            self.stop_roaming()
+            return
+        old_position = self.pos()
+        dx, dy = self.roam_direction
+        self.roam_fraction[0] += dx * self.roaming_speed * delta
+        self.roam_fraction[1] += dy * self.roaming_speed * delta
+        step_x, step_y = int(self.roam_fraction[0]), int(self.roam_fraction[1])
+        self.roam_fraction[0] -= step_x
+        self.roam_fraction[1] -= step_y
+        self.move(self.x() + step_x, self.y() + step_y)
+        self.constrain_to_screen()
+        if (step_x or step_y) and self.pos() == old_position:
+            self.stop_roaming()
+
+    def toggle_roaming(self):
+        self.roaming_enabled = not self.roaming_enabled
+        self.settings["roaming_enabled"] = self.roaming_enabled
+        self.stop_roaming()
+        self.note_activity()
+        self.set_state("idle")
+        save_settings(self.settings)
 
     def frame_path(self, index):
-        pad = str(index).zfill(4)
-        return os.path.join(FRAMES_DIR, self.state, f"frame_{pad}.png")
+        return os.path.join(FRAMES_DIR, self.state, f"frame_{index:04d}.png")
 
     def current_image(self):
         cached = self.cache.get(self.frame_index)
         if cached is not None:
+            self.cache.move_to_end(self.frame_index)
             return cached
         image = QImage(self.frame_path(self.frame_index))
-        if not image.isNull():
-            if len(self.cache) > 5:
-                self.cache.clear()
-            self.cache[self.frame_index] = image
+        if image.isNull():
+            key = (self.state, self.frame_index)
+            if key not in self.missing_frames:
+                log("pet_runtime", f"missing or invalid frame: {self.pet_name}/{key}")
+                self.missing_frames.add(key)
+            return QImage()
+        image = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        self.cache[self.frame_index] = image
+        self.cache_bytes += image.sizeInBytes()
+        while self.cache_bytes > 32 * 1024 * 1024 or len(self.cache) > 128:
+            _, evicted = self.cache.popitem(last=False)
+            self.cache_bytes -= evicted.sizeInBytes()
         return image
 
     def next_frame(self):
+        now = time.monotonic()
+        delta = min(0.1, max(0, now - self.last_tick))
+        self.last_tick = now
+        if not self.drag and not self.menu_open and self.press_global is None and not self.manual_state:
+            age = now - self.last_activity
+            if age >= 90 and self.state != "sleep":
+                self.set_state("sleep", hold=True)
+            elif age >= self.auto_sit_after and self.state not in ("sit", "sleep"):
+                self.set_state("sit", hold=True)
+        self.step_roaming(now, delta)
         info = self.state_info(self.state)
-        count = info["count"]
-        if self.state == "sleep":
-            if not self.hold_state and self.frame_index >= count - 1:
-                self.update()
-                return
-            self.frame_index = (self.frame_index + 1) % count
-        elif self.state in ("interact", "sit"):
-            if not self.hold_state and self.frame_index >= count - 1:
-                self.set_state("idle")
-                return
-            self.frame_index = (self.frame_index + 1) % count
+        elapsed = max(0, (now - self.anim_started_at) * 1000 * self.speed)
+        duration = self.duration_ms()
+        if self.state in ("interact", "sit") and not self.hold_state and elapsed >= duration:
+            self.set_state("idle")
+            return
+        times = info.get("frame_times_ms")
+        position = elapsed % duration
+        if times:
+            index = max(0, min(info["count"] - 1, bisect.bisect_right(times, position) - 1))
         else:
-            self.frame_index = (self.frame_index + 1) % count
-        self.update()
+            index = min(info["count"] - 1, int(position * FPS / 1000))
+        if index != self.frame_index:
+            self.frame_index = index
+            if self.isVisible():
+                self.update()
 
     def paintEvent(self, event):
         info = self.state_info(self.state)
-        bx, by, _, _ = info["bbox"]
+        bx, by, bx2, _ = info["bbox"]
         image = self.current_image()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         status_extra = STATUS_H if self.show_status else 0
         if not image.isNull():
+            scale = self.render_scale
+            pet_width = (bx2 - bx + 1) * scale
+            pet_left = (self.width() - pet_width) / 2
+            offsets = info.get("frame_offsets")
+            offset_x, offset_y = offsets[self.frame_index] if offsets else info.get("offset", (0, 0))
             target = QRectF(
-                PAD - bx * self.scale,
-                status_extra + PAD - by * self.scale,
-                image.width() * self.scale,
-                image.height() * self.scale,
+                pet_left + (offset_x - bx) * scale,
+                status_extra + PAD + (offset_y - by) * scale,
+                image.width() * scale,
+                image.height() * scale,
             )
+            painter.save()
+            if self.state == "move" and self.roam_direction[0] < 0:
+                painter.translate(self.width(), 0)
+                painter.scale(-1, 1)
             painter.drawImage(target, image)
+            painter.restore()
 
         if self.show_status:
-            bar_width = max(
-                120, int((self.width() - 12) * self.bar_length / 100.0)
-            )
-            bar = QRectF(6, 4, bar_width, STATUS_H - 8)
+            bar_width = min(self.width() - 12, self.status_bar_width())
+            bar_x = (self.width() - bar_width) / 2
+            bar = QRectF(bar_x, 4, bar_width, STATUS_H - 8)
             if self.status_active:
                 painter.setBrush(QColor(30, 120, 70, 190))
             else:
@@ -554,6 +744,9 @@ class PetWindow(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            self.stop_roaming()
+            self.pre_drag_manual = self.manual_state
+            self.note_activity()
             self.drag = False
             self.pre_drag_state = self.state
             self.pre_drag_hold = self.hold_state
@@ -562,6 +755,12 @@ class PetWindow(QWidget):
             self.press_time = time.monotonic()
 
     def mouseMoveEvent(self, event):
+        bar_width = self.status_bar_width()
+        bar = QRectF((self.width() - bar_width) / 2, 4, bar_width, STATUS_H - 8)
+        if self.show_status and bar.contains(event.position()):
+            QToolTip.showText(event.globalPosition().toPoint(), self.full_status_text, self)
+        else:
+            QToolTip.hideText()
         if self.press_global is None:
             return
         if self.locked:
@@ -571,10 +770,9 @@ class PetWindow(QWidget):
         dy = current.y() - self.press_global.y()
         if not self.drag and (dx * dx + dy * dy) > 36:
             self.drag = True
-            self.sit_timer.stop()
-            self.sleep_timer.stop()
             if self.state != "move":
                 self.set_state("move")
+                self.press_window = self.pos()
         if self.drag and not (event.buttons() & Qt.LeftButton):
             self.drag = False
             self.press_global = None
@@ -584,9 +782,10 @@ class PetWindow(QWidget):
                 if self.pre_drag_state in MANIFEST["states"]
                 else "idle"
             )
-            self.set_state(target, hold=self.pre_drag_hold)
+            self.set_state(target, hold=self.pre_drag_hold, manual=self.pre_drag_manual)
         elif self.drag:
             self.move(self.press_window.x() + dx, self.press_window.y() + dy)
+            self.constrain_to_screen()
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.LeftButton:
@@ -600,7 +799,7 @@ class PetWindow(QWidget):
                 if self.pre_drag_state in MANIFEST["states"]
                 else "idle"
             )
-            self.set_state(target, hold=self.pre_drag_hold)
+            self.set_state(target, hold=self.pre_drag_hold, manual=self.pre_drag_manual)
             self.save_pet_state()
             return
         if self.press_global is None:
@@ -620,28 +819,35 @@ class PetWindow(QWidget):
             self.toggle_mini()
 
     def contextMenuEvent(self, event):
+        self.stop_roaming()
+        self.menu_open = True
         menu = QMenu(self)
         menu.addAction(
             QAction(
                 "坐下",
                 self,
-                triggered=lambda: self.set_state("sit", hold=True),
+                triggered=lambda: self.set_state("sit", hold=True, manual=True),
             )
         )
         menu.addAction(
             QAction(
                 "放松",
                 self,
-                triggered=lambda: self.set_state("idle", hold=True),
+                triggered=lambda: self.set_state("idle", hold=True, manual=True),
             )
         )
         menu.addAction(
             QAction(
                 "睡觉",
                 self,
-                triggered=lambda: self.set_state("sleep", hold=True),
+                triggered=lambda: self.set_state("sleep", hold=True, manual=True),
             )
         )
+        menu.addSeparator()
+        roam_action = QAction("自动漫游", self, checkable=True)
+        roam_action.setChecked(self.roaming_enabled)
+        roam_action.triggered.connect(self.toggle_roaming)
+        menu.addAction(roam_action)
         menu.addSeparator()
         pet_menu = menu.addMenu("桌宠库")
         for name in list_pets():
@@ -680,7 +886,12 @@ class PetWindow(QWidget):
         menu.addAction(
             QAction("完全退出", self, triggered=self.quit_pet)
         )
-        menu.exec(event.globalPos())
+        try:
+            menu.exec(event.globalPos())
+        finally:
+            self.menu_open = False
+            self.last_activity = time.monotonic()
+            self.auto_sit_after = random.uniform(40, 60)
 
     def scale_up(self):
         self.set_scale(self.scale + 0.1)
@@ -717,44 +928,34 @@ class PetWindow(QWidget):
             pet_state.get("speed", self.settings.get("speed", 1.0))
         )
         self.cache.clear()
+        self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.setInterval(self.tick_ms())
+        self.note_activity()
         self.set_state("idle", hold=False)
-        screen = QGuiApplication.primaryScreen().availableGeometry()
-        pos_x = pet_state.get("pos_x")
-        if pos_x is None:
-            pos_x = self.settings.get("pos_x")
-        pos_y = pet_state.get("pos_y")
-        if pos_y is None:
-            pos_y = self.settings.get("pos_y")
-        if pos_x is not None and pos_y is not None:
-            pos_x = max(
-                screen.x() - self.width() + 60,
-                min(int(pos_x), screen.x() + screen.width() - 60),
-            )
-            pos_y = max(
-                screen.y() - self.height() + 60,
-                min(int(pos_y), screen.y() + screen.height() - 60),
-            )
-            self.move(pos_x, pos_y)
-        else:
-            self.move(
-                screen.x() + (screen.width() - self.width()) // 2,
-                screen.y() + screen.height() - self.height(),
-            )
+        self.restore_position(pet_state)
+        self.save_pet_state()
         self.refresh_status()
         self.update()
 
     def save_pet_state(self):
+        disk = load_settings()
+        self.settings["autostart_with_codex"] = disk.get("autostart_with_codex", False)
         pet_states = self.settings.setdefault("pet_states", {})
         pet_states[self.pet_name] = {
             "scale": self.scale,
             "speed": self.speed,
             "pos_x": self.x(),
             "pos_y": self.y(),
+            "anchor_x": int(self.x() + self.width() / 2),
+            "anchor_y": self.y() + self.height(),
+            "position_format": POSITION_FORMAT,
         }
         self.settings["scale"] = self.scale
         self.settings["pos_x"] = self.x()
         self.settings["pos_y"] = self.y()
+        self.settings["anchor_x"] = int(self.x() + self.width() / 2)
+        self.settings["anchor_y"] = self.y() + self.height()
+        self.settings["position_format"] = POSITION_FORMAT
         save_settings(self.settings)
 
     def save_position(self):
@@ -765,6 +966,8 @@ class PetWindow(QWidget):
         self.settings["mini_mode"] = not self.show_status
         save_settings(self.settings)
         self.apply_geometry()
+        self.constrain_to_screen()
+        self.save_pet_state()
         self.update()
 
     def toggle_fullscreen_auto_hide(self):
@@ -780,37 +983,40 @@ class PetWindow(QWidget):
             if not self.isVisible():
                 self.show()
             return
-        user32 = ctypes.windll.user32
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.GetForegroundWindow.restype = wintypes.HWND
-        user32.GetWindowRect.argtypes = [
-            wintypes.HWND,
-            ctypes.POINTER(wintypes.RECT),
-        ]
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        user32.MonitorFromWindow.restype = wintypes.HANDLE
+
+        class MonitorInfo(ctypes.Structure):
+            _fields_ = [("size", wintypes.DWORD), ("monitor", wintypes.RECT),
+                        ("work", wintypes.RECT), ("flags", wintypes.DWORD)]
+
+        user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
         hwnd = user32.GetForegroundWindow()
-        if not hwnd or hwnd == int(self.winId()):
-            if not self.isVisible():
-                self.show()
-            return
-        rect = wintypes.RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(rect))
-        screen = QGuiApplication.primaryScreen().geometry()
-        full = (
-            rect.left <= screen.x()
-            and rect.top <= screen.y()
-            and rect.right >= screen.x() + screen.width()
-            and rect.bottom >= screen.y() + screen.height()
-        )
+        full = False
+        if hwnd and hwnd != int(self.winId()):
+            rect = wintypes.RECT()
+            monitor = user32.MonitorFromWindow(hwnd, 2)
+            info = MonitorInfo()
+            info.size = ctypes.sizeof(info)
+            if user32.GetWindowRect(hwnd, ctypes.byref(rect)) and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                area = info.monitor
+                full = rect.left <= area.left and rect.top <= area.top and rect.right >= area.right and rect.bottom >= area.bottom
         if full:
             self.hide()
         elif not self.isVisible():
             self.show()
 
     def hide_to_tray(self):
+        self.stop_roaming()
         self.tray_hidden = True
         self.hide()
 
     def show_from_tray(self):
         self.tray_hidden = False
+        self.apply_geometry()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -836,28 +1042,39 @@ class PetWindow(QWidget):
     def open_settings(self):
         self.settings["speed"] = self.speed
         dialog = SettingsDialog(self.settings, self)
-        if dialog.exec() != QDialog.Accepted:
+        was_menu_open = self.menu_open
+        self.menu_open = True
+        self.stop_roaming()
+        try:
+            accepted = dialog.exec() == QDialog.Accepted
+        finally:
+            self.menu_open = was_menu_open
+            self.last_activity = time.monotonic()
+        if not accepted:
             return
         data = dialog.values()
         old_autostart = bool(self.settings.get("autostart_with_codex", False))
-        merged = dict(self.settings)
-        merged.update(data)
-        self.settings = merged
-        save_settings(merged)
+        if bool(data["autostart_with_codex"]) != old_autostart:
+            if not set_autostart(bool(data["autostart_with_codex"])):
+                data["autostart_with_codex"] = old_autostart
+                QMessageBox.warning(self, "Codex 桌宠", "自动启动设置未完成，详情见 autostart.log。")
+        self.settings.update(data)
+        save_settings(self.settings)
+        now = time.monotonic()
+        played_ms = max(0, (now - self.anim_started_at) * 1000 * self.speed)
         self.speed = float(data["speed"])
+        self.anim_started_at = now - played_ms / (1000 * self.speed)
+        self.playback_fps = int(data["playback_fps"])
+        self.roaming_enabled = bool(data["roaming_enabled"])
+        self.roaming_speed = int(data["roaming_speed"])
         self.subtitle_length = data["subtitle_length"]
         self.subtitle_size = int(data["subtitle_size"])
         self.bar_length = int(data["bar_length"])
         self.show_status = not bool(data["mini_mode"])
         self.auto_hide_fullscreen = bool(data["auto_hide_fullscreen"])
         self.timer.setInterval(self.tick_ms())
-        if bool(data["autostart_with_codex"]) != old_autostart:
-            if not set_autostart(bool(data["autostart_with_codex"])):
-                QMessageBox.warning(
-                    self,
-                    "Codex 桌宠",
-                    "随 Codex 启动设置写入失败，请检查系统权限。",
-                )
+        self.stop_roaming()
+        self.apply_geometry()
         self.save_pet_state()
         self.refresh_status()
         self.update()
@@ -910,7 +1127,7 @@ class PetWindow(QWidget):
             if app is not None:
                 app.quit()
             return
-        status = codex_monitor.get_codex_status()
+        status = self.cached_status
         self.status_active = bool(status.get("active"))
         level = SUBTITLE_LEVELS.get(
             self.subtitle_length, SUBTITLE_LEVELS["medium"]
@@ -926,7 +1143,7 @@ class PetWindow(QWidget):
                 parts.append(f"已运行 {self._format_elapsed(elapsed)}")
             tokens = status.get("tokens")
             if tokens is not None:
-                parts.append(f"Token {self._format_tokens(tokens)}")
+                parts.append(f"本轮 Token {self._format_tokens(tokens)}")
         task = status.get("task")
         if task:
             parts.append(self._cut(task, level["task_limit"]))
@@ -942,27 +1159,65 @@ class PetWindow(QWidget):
             if progress:
                 parts.append(self._cut(progress, 80))
         self.status_text = " · ".join(parts)
+        detail = [base]
+        for label, key in (("任务", "task"), ("模型", "model"), ("进度", "progress")):
+            if status.get(key):
+                detail.append(f"{label}：{status[key]}")
+        if status.get("tokens") is not None:
+            detail.append(f"本轮 Token：{status['tokens']:,}")
+        if status.get("session_tokens") is not None:
+            detail.append(f"会话累计 Token：{status['session_tokens']:,}")
+        if status.get("active_count", 0) > 1:
+            detail.append(f"正在运行的会话：{status['active_count']}")
+        detail.append("悬停查看完整信息；右键设置可调帧率与漫游。")
+        self.full_status_text = "\n".join(detail)
+        disk = load_settings()
+        self.settings["autostart_with_codex"] = disk.get("autostart_with_codex", False)
         self.update()
+
+    def receive_status(self, status):
+        was_active = self.status_active
+        self.cached_status = status
+        if status.get("active") and not was_active and not self.manual_state:
+            self.note_activity()
+            if self.state in ("sleep", "sit"):
+                self.set_state("idle")
+        self.refresh_status()
 
 
 def main():
-    with open(PID_FILE, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
-    atexit.register(remove_pid_file)
-    remove_disabled_flag()
-    app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(True)
-    PetWindow()
-    return app.exec()
+    guard = InstanceGuard("pet")
+    if not guard.acquired:
+        guard.close()
+        return 0
+    write_identity("pet", __file__)
+    try:
+        remove_disabled_flag()
+        app = QApplication(sys.argv)
+        app.setQuitOnLastWindowClosed(True)
+        app.setStyle("Fusion")
+        if ACTIVE_PET is None:
+            # Do not let the watcher repeatedly relaunch an empty library.
+            with open(DISABLED_FLAG, "w", encoding="ascii") as handle:
+                handle.write("1")
+            QMessageBox.information(
+                None, "Ark Codex 桌宠",
+                "桌宠库中还没有角色。请按 README.md 的素材导入步骤生成 "
+                "pets/<角色名>/manifest.json，然后重新启动桌宠。",
+            )
+            return 0
+        window = PetWindow()
+        return app.exec()
+    finally:
+        remove_identity("pet")
+        guard.close()
+
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception:
-        with open(ERROR_LOG, "a", encoding="utf-8") as f:
-            f.write(f"{time.ctime()}\n")
-            import traceback
-
-            traceback.print_exc(file=f)
+        import traceback
+        log("pet_error", traceback.format_exc())
         raise

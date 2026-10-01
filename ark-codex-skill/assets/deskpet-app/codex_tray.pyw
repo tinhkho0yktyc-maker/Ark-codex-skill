@@ -1,10 +1,13 @@
 import os
+import json
 import sys
-import winreg
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QMessageBox
+
+import autostart_support
+from process_support import InstanceGuard, remove_identity, write_identity, log
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRAY_PID_FILE = os.path.join(BASE_DIR, "tray.pid")
@@ -18,6 +21,11 @@ PYW_PATH = os.path.join(BASE_DIR, ".venv", "Scripts", "pythonw.exe")
 WATCHER_PATH = os.path.join(BASE_DIR, "codex_pet_launcher.pyw")
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE_NAME = "CodexDeskpetWatcher"
+STARTUP_APPROVED_KEY_PATH = (
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+    r"\StartupApproved\Run"
+)
+STARTUP_ENABLED_VALUE = bytes([2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
 
 
 def write_flag(path):
@@ -68,45 +76,11 @@ def close_pet():
 
 
 def autostart_enabled():
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_READ
-        )
-        try:
-            winreg.QueryValueEx(key, RUN_VALUE_NAME)
-            return True
-        except FileNotFoundError:
-            return False
-        finally:
-            winreg.CloseKey(key)
-    except OSError:
-        return False
+    return autostart_support.autostart_enabled()
 
 
 def set_autostart(enabled):
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            RUN_KEY_PATH,
-            0,
-            winreg.KEY_SET_VALUE,
-        )
-        try:
-            if enabled:
-                command = f'"{PYW_PATH}" "{WATCHER_PATH}"'
-                winreg.SetValueEx(
-                    key, RUN_VALUE_NAME, 0, winreg.REG_SZ, command
-                )
-            else:
-                try:
-                    winreg.DeleteValue(key, RUN_VALUE_NAME)
-                except FileNotFoundError:
-                    pass
-        finally:
-            winreg.CloseKey(key)
-        return True
-    except OSError:
-        return False
+    return autostart_support.set_autostart(enabled)
 
 
 def quit_watcher():
@@ -115,8 +89,11 @@ def quit_watcher():
 
 
 def main():
-    with open(TRAY_PID_FILE, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
+    guard = InstanceGuard("tray")
+    if not guard.acquired:
+        guard.close()
+        return
+    write_identity("tray", __file__)
     try:
         app = QApplication(sys.argv)
         app.setQuitOnLastWindowClosed(False)
@@ -127,7 +104,24 @@ def main():
         close_action = QAction("隐藏桌宠", menu, triggered=close_pet)
         autostart_action = QAction("开机自启动", menu, checkable=True)
         autostart_action.setChecked(autostart_enabled())
-        autostart_action.toggled.connect(set_autostart)
+
+        def refresh_autostart():
+            try:
+                with open(os.path.join(BASE_DIR, "settings.json"), encoding="utf-8") as handle:
+                    enabled = bool(json.load(handle).get("autostart_with_codex", False))
+                autostart_action.blockSignals(True)
+                autostart_action.setChecked(enabled)
+                autostart_action.blockSignals(False)
+            except (OSError, ValueError):
+                pass
+
+        def change_autostart(enabled):
+            if not set_autostart(enabled):
+                refresh_autostart()
+                QMessageBox.warning(None, "Ark Codex 桌宠", "自动启动设置未完成，详情见 autostart.log。")
+
+        autostart_action.toggled.connect(change_autostart)
+        menu.aboutToShow.connect(refresh_autostart)
         exit_action = QAction("退出", menu, triggered=quit_watcher)
         menu.addAction(show_action)
         menu.addAction(close_action)
@@ -149,8 +143,13 @@ def main():
         )
         timer.start(1000)
         app.exec()
+    except Exception:
+        import traceback
+        log("tray", traceback.format_exc())
+        raise
     finally:
-        remove_flag(TRAY_PID_FILE)
+        remove_identity("tray")
+        guard.close()
 
 
 if __name__ == "__main__":
