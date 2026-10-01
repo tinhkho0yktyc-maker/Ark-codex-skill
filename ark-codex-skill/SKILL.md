@@ -1,50 +1,66 @@
 ---
 name: ark-codex-skill
-description: Create or extend transparent desktop pets for Arknights operators using PRTS model exports. Use when the user asks to make a deskpet from an Arknights operator, download operator model/WebM animations, add an operator to the deskpet library, or switch the deskpet character.
+description: Create or extend transparent Windows desktop pets for Arknights operators using PRTS model exports. Use when the user asks to make an operator deskpet, import or download its WebM animations, add a character to a shared deskpet library, or switch the character.
 ---
 
 # Arknights Deskpet
 
-Build a transparent Codex deskpet from PRTS operator models and add it to a reusable deskpet library.
+Build a transparent Windows deskpet from PRTS operator models, or add an operator to an existing shared library. This improved fork is based on [AstrariaX/Ark-codex-skill](https://github.com/AstrariaX/Ark-codex-skill).
 
-## Workflow
+## Choose the project
 
-1. Confirm operator name and optional skin. If no skin is given, use the default (默认).
-2. Resolve the operator page title on PRTS, then export base (基建) WebM animations: `Default`, `Interact`, `Move`, `Relax`, `Sit`, `Sleep`.
-3. Process the WebM files into 1000x1000 transparent PNG frames at 20fps and write `pets/<operator>/manifest.json`.
-4. Add the pet to the deskpet library and launch it. The app supports right-click switching through the `桌宠库` menu.
+Confirm the operator and optional skin; omitted skin means 默认. If the user supplies WebM files, use those files instead of downloading them again.
 
-## Quick Start on a Fresh Machine
+Reuse the existing shared project when adding a character. Keep each operator/skin's input in a separate directory. For different skins of one operator, use distinct library names. Do not scaffold over a running or nonempty project: the scaffolder intentionally refuses to overwrite settings, code or assets.
 
-The deskpet is a Windows Python app. Python 3.10+ and network access to `prts.wiki` are required. Do not use a global environment; always create a project-local `.venv`.
+For a fresh project, Python 3.10+ and Windows 10/11 are required. Always use project-local environments:
 
-```bash
-# 1. Scaffold a new deskpet project and its venv
-python scripts/scaffold_deskpet.py --target <project-dir> --pet "<operator>"
-python scripts/setup_env.py <project-dir>
-
-# 2. Export WebM from PRTS (default skin unless --skin is given)
-python scripts/prts_export.py "<operator>" [--skin "<skin>"] --out <project-dir>/work/webm
-
-# 3. Convert WebM to transparent frames and add to the pet library
-python scripts/process_webm.py --src <project-dir>/work/webm --name "<operator>" --out <project-dir>/pets/<operator>
-
-# 4. Launch
-<project-dir>/启动桌宠.bat
+```powershell
+python scripts/scaffold_deskpet.py --target "<project-dir>" --pet "<operator>"
+python scripts/setup_env.py "<project-dir>"
+python scripts/setup_env.py "<project-dir>" --tools
 ```
 
-## Scripts
+The runtime uses only PySide6-Essentials in `.venv`. Export/conversion tools use Pillow and Playwright in `.tools-venv`; FFmpeg and ffprobe must be on PATH. With a system Chrome/Edge installation, `--tools --skip-browser` avoids downloading another Chromium.
 
-- `scripts/scaffold_deskpet.py` copies the app template into a project and writes an initial `settings.json`.
-- `scripts/setup_env.py` creates `.venv`, installs `PySide6` and `playwright`, and optionally installs Playwright Chromium.
-- `scripts/prts_export.py` automates the PRTS model viewer: loads the model, selects skin/model group/animation, and downloads WebM files.
-- `scripts/process_webm.py` decodes WebM in Chromium, extracts transparent PNG frames, computes bounding boxes, and writes the pet manifest.
-- `scripts/create_shortcuts.py` creates 打开桌宠 shortcuts on the Desktop and in the Start Menu.
+## Export and import
 
-## Notes
+Resolve the exact PRTS operator page and choose the requested skin and 基建 model group. Export Default, Interact, Move, Relax, Sit and Sleep. If automation is appropriate, the bundled exporter can be used:
 
-- The PRTS `Default` WebM export is often a broken 110-byte file. Keep it in `webm/` for reference, but do not map it to a state.
-- If PRTS changes its viewer DOM, update `references/prts-ui.md` and the selectors inside `scripts/prts_export.py`.
-- The generated app remembers position, size, and speed per pet, supports a mini mode, and can auto-hide in fullscreen.
-- A lightweight watcher spawns a separate tray process while ChatGPT/Codex runs. The tray offers `显示桌宠`, `隐藏桌宠` (closes the pet), `开机自启动`, and `退出` (closes pet, tray, and watcher). The tray disappears when the app closes.
-- The app template ships with 予愿安洁莉娜 as the initial pet, so a fresh project can launch immediately.
+```powershell
+<project-dir>/.tools-venv/Scripts/python.exe scripts/prts_export.py "<operator>" --skin "<skin>" --out "<project-dir>/work/webm/<library-name>"
+```
+
+Read [references/prts-ui.md](references/prts-ui.md) when manual export or selector repair is needed. Preserve any supplied source WebM files.
+
+Convert and validate:
+
+```powershell
+<project-dir>/.tools-venv/Scripts/python.exe scripts/process_webm.py --src "<project-dir>/work/webm/<library-name>" --name "<library-name>" --out "<project-dir>/pets/<library-name>"
+<project-dir>/.tools-venv/Scripts/python.exe scripts/validate_deskpet.py "<project-dir>/pets/<library-name>" --allow-inactive --out "<project-dir>/work/<library-name>-preview.png"
+```
+
+Conversion preserves native frame timestamps and alpha, crops only transparent exterior pixels and records original-canvas offsets. Do not resample new assets to the former fixed 20fps. Read [references/manifest.md](references/manifest.md) when adapting the converter or player.
+
+Relax maps to idle, Interact to interact, Move to move, Sit to sit and Sleep to sleep. Files under 1000 bytes are skipped; Default is often a broken 110-byte export and does not become a state. All five playable states are required. Duplicate state files are rejected instead of silently mixing characters.
+
+The converter stages a complete pet before publishing it and refuses an existing destination. To rebuild a pet, use a fresh output directory, inspect the preview and preserve the old assets before a deliberate replacement with the app stopped. If the decoded source has opaque black background, prefer a transparent re-export. Only use `--recover-black` when approximation is intended; inspect dark outlines and shadows before accepting it.
+
+Restart the project, select the pet through the 桌宠库 menu and verify visible transparency, all five actions, scale and screen position. Initial projects retain the upstream 予愿安洁莉娜 sample, so they can launch before the requested pet is imported. If no valid pet exists, the app shows an import hint rather than failing during module import.
+
+## Runtime behavior
+
+- Per-pet position, scale and animation speed are remembered.
+- Subtitle width is independent of pet scale; hovering reveals full local task information.
+- Automatic rest starts after about 40–60 seconds and sleep after 90 seconds. Manual states take precedence.
+- Roaming is optional and starts disabled. It pauses for interaction, dragging, menus and rest.
+- The playback cap defaults to 60fps, but old 20fps assets cannot gain frames without reconversion.
+- The Codex monitor reads rollout logs under CODEX_HOME/sessions or the default ~/.codex/sessions; it does not change Codex data.
+- Autostart is optional and starts disabled. Only enable it or create shortcuts when requested. The watcher shows the pet and tray while Codex/ChatGPT is running, with project-scoped single-instance guards and crash backoff.
+- Tray Exit ends normal supervision; do not bypass a user's deliberate hide or exit choice.
+
+When changing the template, run `tests/test_deskpet.py` with the runtime environment and `tests/test_pipeline.py` with the tools environment. Tests use isolated generated fixtures, not personal operator assets. Do not launch a second watcher or register test startup entries.
+
+## Source and sharing
+
+Preserve the original project URL and author attribution. The upstream has no explicit LICENSE; do not invent licensing for its code or third-party art. Retain personal-learning/noncommercial notes. For sharing, exclude settings, logs, identity/PID/flag files, virtual environments, session data and newly downloaded character assets unless the user has appropriate rights and explicitly requests their inclusion.
