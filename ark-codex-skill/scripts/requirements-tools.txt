@@ -1,0 +1,3 @@
+# Export and transparent native-timing conversion; separate from daily runtime.
+Pillow==12.3.0
+playwright>=1.55,<2

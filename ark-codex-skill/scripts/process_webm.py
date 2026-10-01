@@ -1,213 +1,261 @@
 #!/usr/bin/env python3
-"""Convert PRTS WebM exports into transparent PNG frames for a deskpet."""
+"""Convert PRTS WebM to transparent, cropped PNGs with original timestamps.
+
+FFmpeg/ffprobe must be on PATH, including libvpx/libvpx-vp9 decoders.
+Existing pet directories are never overwritten. Conversion is staged locally;
+only a complete manifest and all five states are moved into the destination.
+"""
 
 import argparse
-import base64
-import functools
-import http.server
 import json
+import math
 import os
+import re
 import shutil
-import socketserver
-import sys
-import threading
-import urllib.parse
+import statistics
+import subprocess
+import tempfile
+from pathlib import Path
 
-try:
-    from playwright.sync_api import sync_playwright
-except ImportError:
-    sys.exit("playwright is required: run 'pip install playwright' first")
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
-FPS = 20
-SIZE = 1000
-STATE_MAP = [
-    ("Relax", "idle"),
-    ("Interact", "interact"),
-    ("Move", "move"),
-    ("Sit", "sit"),
-    ("Sleep", "sleep"),
-]
-
-HTML = """<!doctype html>
-<html>
-<body style="margin:0">
-<video id="v" muted playsinline preload="auto"></video>
-<canvas id="c"></canvas>
-<script>
-const SIZE = %d;
-const v = document.getElementById('v');
-const c = document.getElementById('c');
-c.width = SIZE;
-c.height = SIZE;
-const ctx = c.getContext('2d');
-async function capture(src) {
-  v.src = src;
-  if (v.readyState < 1) {
-    await new Promise((res) => v.addEventListener('loadedmetadata', res, { once: true }));
-  }
-  const frames = [];
-  let minX = SIZE, minY = SIZE, maxX = -1, maxY = -1;
-  let done;
-  const ended = new Promise((res) => { done = res; });
-  v.addEventListener('ended', done, { once: true });
-  function step(now, meta) {
-    ctx.clearRect(0, 0, SIZE, SIZE);
-    ctx.drawImage(v, 0, 0, SIZE, SIZE);
-    const data = ctx.getImageData(0, 0, SIZE, SIZE).data;
-    for (let y = 0; y < SIZE; y += 2) {
-      for (let x = 0; x < SIZE; x += 2) {
-        const a = data[(y * SIZE + x) * 4 + 3];
-        if (a > 10) {
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-        }
-      }
-    }
-    frames.push({ t: meta.mediaTime, url: c.toDataURL('image/png') });
-    if (!v.ended) v.requestVideoFrameCallback(step);
-  }
-  v.requestVideoFrameCallback(step);
-  await v.play();
-  await ended;
-  return {
-    duration: v.duration,
-    frames,
-    bbox: maxX >= 0 ? [minX, minY, maxX, maxY] : null
-  };
-}
-window.capture = capture;
-</script>
-</body>
-</html>
-""" % SIZE
+STATE_MAP = (
+    ("Relax", "idle"), ("Interact", "interact"), ("Move", "move"),
+    ("Sit", "sit"), ("Sleep", "sleep"),
+)
 
 
-def find_chrome():
-    candidates = [
-        os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE", ""),
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/usr/bin/google-chrome",
-        "/usr/bin/chromium",
-    ]
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
-    return None
-
-
-def pick_frames(count, duration, frames):
-    max_t = max(0.01, duration - 0.02)
-    out = []
-    for i in range(count):
-        target = (i / count) * max_t
-        best = min(frames, key=lambda f: abs(f["t"] - target))
-        out.append(best["url"])
-    return out
-
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            data = HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            return
-        super().do_GET()
-
-    def log_message(self, format, *args):
-        pass
-
-
-def run(src, name, out):
-    pet_dir = out
-    frames_dir = os.path.join(pet_dir, "frames")
-    webm_dir = os.path.join(pet_dir, "webm")
-    os.makedirs(frames_dir, exist_ok=True)
-    os.makedirs(webm_dir, exist_ok=True)
-
-    state_files = {}
-    for fname in sorted(os.listdir(src)):
-        if not fname.lower().endswith(".webm"):
+def find_sources(directory):
+    directory = Path(directory)
+    sources = {}
+    for path in sorted(directory.iterdir()):
+        if not path.is_file() or path.suffix.lower() != ".webm":
             continue
-        full = os.path.join(src, fname)
-        if os.path.getsize(full) < 1000:
-            print("skip broken webm:", fname)
+        if path.stat().st_size < 1000:
+            print("skip broken WebM:", path.name, flush=True)
             continue
         for token, state in STATE_MAP:
-            if token.lower() in fname.lower():
-                state_files[state] = fname
+            if re.search(rf"(?<![a-z]){token}(?![a-z])", path.stem, re.IGNORECASE):
+                if state in sources:
+                    raise ValueError(
+                        f"Multiple files for {state}; use one operator/skin per source directory."
+                    )
+                sources[state] = path
                 break
-    if not state_files:
-        sys.exit("no valid WebM files found in " + src)
+    missing = [token for token, state in STATE_MAP if state not in sources]
+    if missing:
+        raise ValueError("Missing valid WebM animations: " + ", ".join(missing))
+    return sources
 
-    for fname in state_files.values():
-        shutil.copy2(os.path.join(src, fname), os.path.join(webm_dir, fname))
 
-    with sync_playwright() as p:
-        chrome = find_chrome()
-        if chrome:
-            browser = p.chromium.launch(executable_path=chrome, headless=True)
-        else:
-            browser = p.chromium.launch(headless=True)
-        handler = functools.partial(Handler, directory=src)
-        httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler)
-        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        thread.start()
-        base = f"http://127.0.0.1:{httpd.server_address[1]}/"
-        manifest = {"fps": FPS, "size": SIZE, "states": {}}
-        try:
-            page = browser.new_page(
-                viewport={"width": 900, "height": 900}
+def probe(path):
+    command = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+        "stream=codec_name,width,height:stream_tags=alpha_mode:"
+        "format=duration:frame=best_effort_timestamp_time",
+        "-show_frames", "-of", "json", str(path),
+    ]
+    result = subprocess.run(command, capture_output=True, check=True, timeout=120)
+    data = json.loads(result.stdout)
+    if not data.get("streams"):
+        raise ValueError(f"No video stream: {path.name}")
+    stream = data["streams"][0]
+    times = [
+        float(frame["best_effort_timestamp_time"]) * 1000
+        for frame in data.get("frames", [])
+        if frame.get("best_effort_timestamp_time") is not None
+    ]
+    if not times or any(not math.isfinite(t) for t in times):
+        raise ValueError(f"No usable frame timestamps: {path.name}")
+    origin = times[0]
+    times = [round(t - origin, 3) for t in times]
+    if times != sorted(times) or (len(times) > 1 and any(b <= a for a, b in zip(times, times[1:]))):
+        raise ValueError(f"Non-increasing frame timestamps: {path.name}")
+    interval = statistics.median([b - a for a, b in zip(times, times[1:])]) if len(times) > 1 else 1000 / 60
+    try:
+        duration = float(data.get("format", {}).get("duration", 0)) * 1000 - origin
+    except (TypeError, ValueError):
+        duration = 0
+    if not math.isfinite(duration) or duration <= times[-1]:
+        duration = times[-1] + interval
+    if not 1 <= stream["width"] == stream["height"] <= 8192:
+        raise ValueError(f"Expected a square model canvas: {path.name}")
+    return stream, times, round(duration, 3)
+
+
+def transparent_crop(image, recover_black=False):
+    points = (
+        (0, 0), (image.width - 1, 0),
+        (0, image.height - 1), (image.width - 1, image.height - 1),
+    )
+    opaque_black = sum(
+        image.getpixel(p)[3] >= 250 and max(image.getpixel(p)[:3]) <= 12
+        for p in points
+    ) >= 3
+    origin_x = origin_y = 0
+    if opaque_black:
+        if not recover_black:
+            raise ValueError(
+                "The decoded WebM has an opaque black background. Re-export "
+                "with transparency, or explicitly use --recover-black (approximate)."
             )
-            page.goto(base, wait_until="domcontentloaded")
-            for state, fname in state_files.items():
-                print("capturing", state, fname)
-                src_url = "/" + urllib.parse.quote(fname)
-                result = page.evaluate("(src) => window.capture(src)", src_url)
-                duration = float(result["duration"])
-                count = max(1, round(duration * FPS))
-                urls = pick_frames(count, duration, result["frames"])
-                state_dir = os.path.join(frames_dir, state)
-                os.makedirs(state_dir, exist_ok=True)
-                for i, url in enumerate(urls):
-                    png = base64.b64decode(url.split(",", 1)[1])
-                    with open(
-                        os.path.join(state_dir, f"frame_{i:04d}.png"), "wb"
-                    ) as f:
-                        f.write(png)
-                manifest["states"][state] = {
-                    "duration": round(duration * 1000),
-                    "count": len(urls),
-                    "bbox": result["bbox"] or [0, 0, SIZE - 1, SIZE - 1],
-                    "source": fname,
-                }
-                print("  wrote", len(urls), "frames")
-        finally:
-            httpd.shutdown()
-            browser.close()
+        red, green, blue, _ = image.split()
+        brightness = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+        seed = brightness.point(lambda value: 255 if value > 12 else 0)
+        bounds = seed.getbbox()
+        if bounds is None:
+            return Image.new("RGBA", (1, 1)), (0, 0), None
+        left, top, right, bottom = bounds
+        region = (
+            max(0, left - 8), max(0, top - 8),
+            min(image.width, right + 8), min(image.height, bottom + 8),
+        )
+        image = image.crop(region)
+        barrier = seed.crop(region).filter(ImageFilter.MaxFilter(5))
+        zones = barrier.copy()
+        for point in (
+            (0, 0), (zones.width - 1, 0),
+            (0, zones.height - 1), (zones.width - 1, zones.height - 1),
+        ):
+            if zones.getpixel(point) == 0:
+                ImageDraw.floodfill(zones, point, 128, thresh=0)
+        alpha = zones.point(lambda value: 0 if value == 128 else 255)
+        image.putalpha(alpha.filter(ImageFilter.GaussianBlur(0.65)))
+        origin_x, origin_y = region[:2]
+    elif image.getchannel("A").getextrema()[0] > 10:
+        raise ValueError("The decoded frame has no transparent exterior; re-export the model.")
 
-    with open(
-        os.path.join(pet_dir, "manifest.json"), "w", encoding="utf-8"
-    ) as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
-    print("manifest", json.dumps(manifest, ensure_ascii=False, indent=2))
+    visible = image.getchannel("A").point(lambda value: 255 if value > 10 else 0).getbbox()
+    if visible is None:
+        return Image.new("RGBA", (1, 1)), (0, 0), None
+    left, top, right, bottom = visible
+    crop = (
+        max(0, left - 4), max(0, top - 4),
+        min(image.width, right + 4), min(image.height, bottom + 4),
+    )
+    bbox = [left + origin_x, top + origin_y, right + origin_x - 1, bottom + origin_y - 1]
+    return image.crop(crop), (origin_x + crop[0], origin_y + crop[1]), bbox
+
+
+def read_frame(handle, size):
+    pieces = []
+    remaining = size
+    while remaining:
+        data = handle.read(remaining)
+        if not data:
+            break
+        pieces.append(data)
+        remaining -= len(data)
+    return b"".join(pieces)
+
+
+def decode_state(source, state_dir, stream, times, recover_black):
+    command = ["ffmpeg", "-v", "error", "-threads", "2"]
+    decoder = {"vp9": "libvpx-vp9", "vp8": "libvpx"}.get(stream["codec_name"])
+    if decoder:
+        command += ["-c:v", decoder]
+    command += [
+        "-i", str(source), "-fps_mode", "passthrough",
+        "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
+    ]
+    width, height = stream["width"], stream["height"]
+    offsets, union, count = [], None, 0
+    state_dir.mkdir(parents=True)
+    # A temporary stderr file avoids deadlocking a full stderr pipe.
+    with tempfile.TemporaryFile() as errors, subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=errors,
+    ) as process:
+        try:
+            while True:
+                data = read_frame(process.stdout, width * height * 4)
+                if not data:
+                    break
+                if len(data) != width * height * 4:
+                    raise ValueError("Incomplete RGBA frame")
+                image, offset, box = transparent_crop(
+                    Image.frombytes("RGBA", (width, height), data), recover_black,
+                )
+                image.save(state_dir / f"frame_{count:04d}.png", compress_level=7)
+                offsets.append(offset)
+                if box:
+                    union = box if union is None else [
+                        min(union[0], box[0]), min(union[1], box[1]),
+                        max(union[2], box[2]), max(union[3], box[3]),
+                    ]
+                count += 1
+                if count % 200 == 0:
+                    print(f"{state_dir.name}: {count}/{len(times)} frames", flush=True)
+            if process.wait(timeout=30) != 0:
+                errors.seek(0)
+                raise ValueError(errors.read().decode("utf-8", errors="replace"))
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+    if count != len(times) or union is None:
+        raise ValueError(f"Frame/timestamp mismatch or empty animation: {count}/{len(times)}")
+    return offsets, union, count
+
+
+def run(src, name, out, recover_black=False):
+    src, out = Path(src).resolve(), Path(out).resolve()
+    if out.exists():
+        raise FileExistsError(
+            f"Destination already exists: {out}. Convert to a new directory; "
+            "back up existing assets before replacing them."
+        )
+    if not all(shutil.which(command) for command in ("ffmpeg", "ffprobe")):
+        raise RuntimeError("FFmpeg and ffprobe are required on PATH.")
+    sources = find_sources(src)
+    probed = {state: probe(path) for state, path in sources.items()}
+    sizes = {data[0]["width"] for data in probed.values()}
+    if len(sizes) != 1:
+        raise ValueError("Animations do not share the same canvas size.")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if recover_black:
+        print("WARNING: black-background recovery is approximate; inspect the contact sheet.", flush=True)
+    with tempfile.TemporaryDirectory(prefix=".ark-build-", dir=out.parent) as temporary:
+        staged = Path(temporary) / "pet"
+        manifest = {
+            "name": name, "schema_version": 2, "native_timing": True,
+            "fps": 60, "size": sizes.pop(), "states": {},
+        }
+        (staged / "webm").mkdir(parents=True)
+        for state, source in sources.items():
+            stream, times, duration = probed[state]
+            print("converting", state, source.name, flush=True)
+            offsets, bbox, count = decode_state(
+                source, staged / "frames" / state, stream, times, recover_black,
+            )
+            shutil.copy2(source, staged / "webm" / source.name)
+            manifest["states"][state] = {
+                "duration": duration, "count": count, "bbox": bbox, "source": source.name,
+                "frame_times_ms": times, "frame_offsets": offsets,
+                "source_average_fps": round((count - 1) * 1000 / times[-1], 3) if count > 1 else 0,
+            }
+            print(f"  wrote {count} native frames", flush=True)
+        (staged / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+        if out.exists():
+            raise FileExistsError(f"Destination appeared during conversion: {out}")
+        os.rename(staged, out)
+    print("pet ready at", out)
+    return manifest
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--src", required=True, help="directory with WebM files")
-    parser.add_argument("--name", required=True, help="operator name")
-    parser.add_argument("--out", required=True, help="pet directory to write")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--src", required=True, type=Path, help="one operator/skin WebM directory")
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--recover-black", action="store_true",
+                        help="approximate alpha recovery; use only for opaque black exports")
     args = parser.parse_args()
-    run(args.src, args.name, args.out)
+    try:
+        run(args.src, args.name, args.out, args.recover_black)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        parser.exit(1, f"Conversion failed: {exc}\n")
 
 
 if __name__ == "__main__":
