@@ -1,155 +1,153 @@
-# Ark Codex Skill
+# Ark Codex Skill · 共享桌宠改进版
 
-用AI辅助制作的一个用于制作《明日方舟》透明桌面宠物（Codex 桌宠）的 Codex skill。给它一个干员名（可选皮肤名），它会自动从 PRTS Wiki 导出该干员的基建 WebM 动画，转换成带透明通道的 PNG 帧，生成桌宠并加入桌宠库。
+用明日方舟干员的 PRTS 基建模型制作透明 Windows 桌宠，也可以让多个角色共享一套程序。本仓库发布的是可安装的 Codex Skill、桌宠源码模板和素材工具，不是打包好的 EXE 安装程序。
 
-> 仓库：[AstrariaX/Ark-codex-skill](https://github.com/AstrariaX/Ark-codex-skill)
+## 原项目与致谢
 
-## 功能特性
+**原项目地址：[AstrariaX/Ark-codex-skill](https://github.com/AstrariaX/Ark-codex-skill)**
 
-- 自动检索 PRTS 干员页面并加载“干员模型”查看器
-- 默认使用原皮（默认时装），也可指定任意时装组
-- 模型组固定使用“基建”，导出 `Default / Interact / Move / Relax / Sit / Sleep` 六段动画
-- 自动跳过 PRTS 导出的坏文件（`Default` 经常是 110 字节空文件）
-- 将 WebM 抽帧为 1000×1000、20fps 的透明 PNG，自动计算包围盒并生成 `manifest.json`
-- 支持桌宠库：可以存放多个干员，右键“桌宠库”随时切换
-- 系统托盘：ChatGPT/Codex 运行时拉起托盘进程，提供“显示桌宠 / 隐藏桌宠 / 开机自启动 / 退出”，应用退出时托盘一起退出
-- 一键生成桌面和开始菜单的“打开桌宠 / 启动托盘”快捷方式
-- 项目模板初始自带予愿安洁莉娜，生成后可以直接启动
-- 生成的项目自带完整桌宠程序：状态字幕、拖动、锁定、迷你模式、全屏自动隐藏、按角色记忆位置/大小/倍速、随 ChatGPT/Codex 启动
+本项目 Fork 自 AstrariaX 的 Ark Codex Skill，在原桌宠模板上修复问题并增加功能。感谢原作者提供的 Skill、PRTS 导出脚本与桌宠模板。此改进版并非原作者的官方发布。
 
-## 监听器说明
+改进版仓库：[tinhkho0yktyc-maker/Ark-codex-skill](https://github.com/tinhkho0yktyc-maker/Ark-codex-skill)。
 
-`codex_pet_launcher.pyw` 是一个轻量常驻监听器，负责整个生命周期：
+## 本次改进
 
-- 检测到 ChatGPT / Codex 启动时，拉起桌宠和托盘进程
-- 检测到 ChatGPT / Codex 退出时，关闭桌宠和托盘进程
-- 托盘图标 `codex_tray.pyw` 只在 ChatGPT / Codex 运行期间存在
+- 共享桌宠库：右键切换角色，分别保存位置、大小和动作倍速。
+- 字幕宽度与角色缩放分离，设置立即生效；悬停查看完整任务、模型、进度及 Token 信息。
+- 兼容新旧 Codex 日志，后台增量读取；区分本轮 Token 与会话累计 Token。
+- 无操作约 40–60 秒自动坐下、90 秒自动睡觉；手动选择的状态优先，新任务可以唤醒自动休息。
+- 自动漫游：随机短距离行走、停顿与方向变化；互动、拖动、菜单和休息期间暂停，可随时关闭。
+- 角色缩放、动作切换、显示器和 DPI 变化后约束到屏幕工作区。
+- 桌宠、托盘、监听器与轻量守护父进程分别做单实例和身份校验；异常退出退避恢复，正常退出不强行拉起。
+- 登录后监听 Codex/ChatGPT；支持计划任务与注册表备用入口，日志轮转和原子设置保存。
+- 日常运行环境与素材工具环境分离。
+- 新素材转换保留原 WebM 帧及时间戳，裁去透明外边缘，并记录原画布偏移；兼容上游固定帧率素材。
+- 附带 43 项隔离回归测试，使用临时生成的非游戏素材，不需要本机新增干员文件。
 
-如果监听器被手动退出（例如托盘里的“退出”），ChatGPT 再次启动时不会自动拉起桌宠。恢复方式：
-
-1. 下次登录 Windows 时注册表会自动启动监听器
-2. 或双击“启动托盘”快捷方式手动恢复
-
-托盘菜单说明：
-
-- `显示桌宠`：显示或重新拉起桌宠
-- `隐藏桌宠`：关闭桌宠（功能等同原来的“完全退出桌宠”），托盘保留，可再次用“显示桌宠”打开
-- `开机自启动`：勾选后登录 Windows 时自动启动监听器
-- `退出`：关闭桌宠、托盘和监听器本身
-
-## 快捷方式
-
-`create_shortcuts.py` 会在桌面和开始菜单创建两个快捷方式：
-
-- `打开桌宠.lnk`：直接启动桌宠
-- `启动托盘.lnk`：启动监听器（托盘），推荐在监听器退出后使用
-
-## 目录结构
-
-```text
-ark-codex-skill/
-├── README.md
-├── .gitignore
-└── ark-codex-skill/             # 可安装的 skill 本体
-    ├── SKILL.md                 # Codex skill 主说明
-    ├── agents/
-    │   └── openai.yaml          # Codex UI 元数据
-    ├── scripts/
-    │   ├── scaffold_deskpet.py  # 生成桌宠项目
-    │   ├── setup_env.py         # 创建 .venv 并安装依赖
-    │   ├── prts_export.py       # 从 PRTS 导出 WebM
-    │   ├── process_webm.py      # WebM 转透明 PNG 帧
-    │   └── create_shortcuts.py  # 创建桌面/开始菜单快捷方式
-    ├── references/
-    │   └── prts-ui.md           # PRTS 查看器 DOM 参考
-    └── assets/
-        └── deskpet-app/         # 桌宠应用模板
-            └── pets/予愿安洁莉娜/  # 初始自带角色
-```
+自动启动与自动漫游默认关闭，由用户在菜单中开启。
 
 ## 环境要求
 
-- Windows 10/11（桌宠程序目前仅适配 Windows）
-- Python 3.10 或更高版本
-- 可访问 `https://prts.wiki`
-- 有网络权限安装依赖（PySide6、Playwright）
+- Windows 10/11，Python 3.10+（推荐 3.12）。
+- 日常桌宠仅需 PySide6-Essentials，安装到项目内的 `.venv`。
+- 制作新角色需 FFmpeg 和 ffprobe 在 PATH 中；素材工具使用独立 `.tools-venv`，包含 Pillow、Playwright。
+- 自动从 PRTS 导出时需要访问 [PRTS Wiki](https://prts.wiki)；已下载 WebM 可直接导入，无需再次访问网站。
 
-所有依赖都安装到项目自己的 `.venv`，不会影响全局 Python 环境。
+## 方法一：让 Codex 使用 Skill
 
-## 使用指南
-
-### 第一步：部署这个 skill
-
-直接对 Codex 说：
+对 Codex 说：
 
 ```text
-安装 GitHub 仓库 AstrariaX/Ark-codex-skill 里的 ark-codex-skill skill
+安装 GitHub 仓库 tinhkho0yktyc-maker/Ark-codex-skill 里的 ark-codex-skill skill
 ```
 
-也可以手动安装：把仓库里的 `ark-codex-skill/` 目录复制到 `~/.codex/skills/`。
+已经安装同名旧 Skill 时，请先备份再更新。更新 Skill 不会自动升级你此前生成的桌宠项目；不要直接覆盖旧项目中的设置或角色素材。
 
-如果使用 Codex 的 skill 安装器，也可以这样安装：
-
-```text
---repo AstrariaX/Ark-codex-skill --path ark-codex-skill
-```
-
-### 第二步：调用
-
-默认原皮：
-
-```text
-用 ark-codex-skill 制作干员 浊心斯卡蒂 的桌宠
-```
-
-指定皮肤：
+安装后可以说：
 
 ```text
 用 ark-codex-skill 制作干员 浊心斯卡蒂 的桌宠，皮肤用 升华
 ```
 
-不写皮肤就是默认原皮。制作完成后右键小人 -> 桌宠库，可以随时切换已入库的角色。
+或者：
 
-注意：项目初始自带予愿安洁莉娜，可以直接双击 `启动桌宠.bat`；想加入其他角色时，再按上面的流程制作。
+```text
+把这些 WebM 导入已有的共享桌宠项目，角色是 凯尔希·思衡托
+```
 
-## 桌宠功能
+添加角色应复用已有项目，不需要再生成一套独立运行环境。
 
-- 单击播放互动动画
-- 双击切换迷你模式（隐藏/显示字幕条）
-- 拖动播放走路动画，松手恢复之前状态
-- 右键菜单：坐下 / 放松 / 睡觉 / 桌宠库 / 锁定 / 设置 / 放大 / 缩小 / 退出
-- 头顶字幕：Codex 运行状态、最近任务、模型、运行时长、Token 用量、最近完成时间
-- 每个角色独立记住位置、大小、动作倍速
-- 迷你模式、全屏应用自动隐藏
-- 可设置随 ChatGPT / Codex 启动和关闭
-- 监听 `~/.codex/sessions/`，只读不修改 Codex 数据
+## 方法二：不用 Codex，手动生成桌宠
+
+在本仓库网页点击 **Code → Download ZIP**，解压后打开仓库目录中的 PowerShell。以下命令从仓库根目录执行：
+
+```powershell
+python ark-codex-skill/scripts/scaffold_deskpet.py --target my-deskpet
+python ark-codex-skill/scripts/setup_env.py my-deskpet
+.\my-deskpet\启动桌宠.bat
+```
+
+模板保留了原仓库自带的予愿安洁莉娜示例，因此无需先下载新角色即可启动。若未安装 Python，请使用 [Python 官方下载](https://www.python.org/downloads/windows/)；遇到依赖报错可使用 Python 3.12。
+
+脚手架拒绝覆盖非空目录。添加角色请按下一节操作；要重新生成项目，请选择新的空目录。
+
+## 导入自己的 WebM
+
+先安装独立素材工具：
+
+```powershell
+python ark-codex-skill/scripts/setup_env.py my-deskpet --tools
+ffmpeg -version
+ffprobe -version
+```
+
+已有系统 Chrome/Edge、不想额外下载 Chromium，可以在第一条命令末尾加 `--skip-browser`。
+
+把**同一个干员、同一款皮肤**的 WebM 放在 `my-deskpet/work/webm/<角色名>/`。文件名需包含动画名：`Relax`、`Interact`、`Move`、`Sit`、`Sleep`。PRTS 导出的 `Default` 常是 110 字节坏文件，不用于动作映射。
+
+例如：
+
+```powershell
+.\my-deskpet\.tools-venv\Scripts\python.exe ark-codex-skill/scripts/process_webm.py --src "my-deskpet/work/webm/凯尔希·思衡托" --name "凯尔希·思衡托" --out "my-deskpet/pets/凯尔希·思衡托"
+.\my-deskpet\.tools-venv\Scripts\python.exe ark-codex-skill/scripts/validate_deskpet.py "my-deskpet/pets/凯尔希·思衡托" --allow-inactive --out "my-deskpet/work/凯尔希预览.png"
+```
+
+重新启动桌宠后，右键 **桌宠库** 选择新角色。转换过程中不改原 WebM，失败不留下半成品角色，也不会覆盖已存在的角色目录。重处理同名角色时，请先输出到新目录，确认预览后关闭桌宠、保留旧素材，再替换。
+
+若解码得到不透明黑底，工具会明确报错。优先重新导出带透明通道的素材；仅在确实需要近似去黑底时使用 `--recover-black`，并检查轮廓、阴影和预览。它不是无损透明恢复。
+
+### 从 PRTS 自动导出
+
+```powershell
+.\my-deskpet\.tools-venv\Scripts\python.exe ark-codex-skill/scripts/prts_export.py "浊心斯卡蒂" --skin "升华" --out "my-deskpet/work/webm/浊心斯卡蒂"
+```
+
+不写 `--skin` 使用默认时装。导出依赖 PRTS 查看器的页面结构，网站改版或下载失败时可手动导出六段动画，再使用同一转换流程。自动导出脚本沿用上游实现，此次发布未重新做线上 PRTS 导出测试。
+
+## 操作与启动
+
+- 单击互动，双击切换迷你模式。
+- 右键解锁后可以拖动；松开恢复之前的状态。
+- 右键选择坐下、放松、睡觉，手动状态不会被自动休息覆盖。
+- 右键 **自动漫游** 开关移动；设置中调整速度、动作倍速与 20/30/60fps 播放上限。
+- **随 Codex 启动** 或托盘 **开机自启动** 是可选项，开启后注册当前用户登录任务与备用启动项；检测到 Codex/ChatGPT 才显示桌宠和托盘。
+- 托盘 **隐藏桌宠** 关闭小人，本次宿主运行期间不会立即重拉；**显示桌宠** 可恢复。
+- 托盘 **退出** 停止整套监听。之后可双击“启动托盘”快捷方式，或运行项目内 `codex_pet_launcher.pyw` 恢复。
+- 同一用户的自启动入口指向一个项目；更换项目目录后，需要重新设置自动启动。
+
+创建桌面和开始菜单快捷方式（可选）：
+
+```powershell
+python ark-codex-skill/scripts/create_shortcuts.py --project my-deskpet
+```
 
 ## 常见问题
 
-### PRTS 导出失败或按钮找不到
+**为什么六个 WebM 只有三个待机选项？** 六段源动画不等于六个待机模式。`Relax` 映射放松/待机，`Sit` 和 `Sleep` 是休息选项；`Move` 用于拖动和漫游，`Interact` 用于单击互动，坏的 `Default` 不使用。
 
-PRTS 页面改版会影响脚本。先看 `ark-codex-skill/references/prts-ui.md` 里的 DOM 说明，再同步更新 `ark-codex-skill/scripts/prts_export.py` 的选择器。
+**把播放上限改成 60fps，就能让旧角色更流畅吗？** 不能凭空补帧。上游示例仍是原来的固定帧率素材；只有重新从 WebM 转换为 v2 时间戳素材，才能恢复源视频本来有的帧。动作倍速只改变时长，不提升素材帧率。
 
-### 打开后没有看到小人
+**字幕仍被省略怎么办？** 调整字幕条宽度，或悬停查看完整内容；字符很多时仍会用省略号。字幕只读本地 Codex rollout 日志，多会话优先显示最近更新的运行中会话，不保证总是前台聊天。
 
-运行 `my-deskpet/调试运行.bat`，把控制台报错或 `pet_error.log` 内容发出来。
+**看不到桌宠怎么办？** 先用托盘“显示桌宠”，再运行 `调试运行.bat`。检查项目内 `pet_error.log`、`pet_runtime.log`、`watcher.log`、`autostart.log`。这些日志可能含个人路径，不要未经检查直接公开。
 
-### 需要手动从网站下载素材
+## 开发与验证
 
-可以直接在 PRTS 干员页的“干员模型”里手动操作：
+```powershell
+.\my-deskpet\.venv\Scripts\python.exe ark-codex-skill/tests/test_deskpet.py
+.\my-deskpet\.tools-venv\Scripts\python.exe ark-codex-skill/tests/test_pipeline.py
+```
 
-1. 点击“点此载入模型”
-2. 时装组选默认（或指定皮肤）
-3. 模型组选“基建”
-4. 动画依次选 `Default / Interact / Move / Relax / Sit / Sleep`
-5. 点击下载图标按钮导出 WebM
-6. 把文件放进 `my-deskpet/work/webm/`，再让 Codex 用 skill 继续抽帧入库
+第一组 33 项测试覆盖日志解析、进程身份、恢复与窗口行为；第二组 10 项测试覆盖脚手架、透明转换和失败清理，包括真实 FFmpeg 合成 WebM 的往返测试。测试不会修改已运行桌宠的设置、启动项或 Codex 会话。实际关机重启、不同显示器组合与线上 PRTS 导出仍需在对应环境验证。
 
-## 注意事项
+v2 素材格式说明见 [manifest 参考](ark-codex-skill/references/manifest.md)。
 
-- 《明日方舟》素材版权归 Hypergryph 所有，PRTS 资料遵循其站内许可。本项目仅用于个人学习与自用，请勿用于商业发布。
-- 桌宠程序目前仅支持 Windows；macOS/Linux 可以运行素材处理脚本，但桌宠程序需要额外适配。
+## 版权、许可与发布范围
 
-## 贡献
+- 原代码和上游示例来自 [AstrariaX/Ark-codex-skill](https://github.com/AstrariaX/Ark-codex-skill)，保留原作者归属和来源。
+- 上游目前未提供明确的 LICENSE。本 Fork 不擅自为原作者代码增加 MIT、Apache 等许可证；注明来源不等于获得额外再分发授权。
+- 《明日方舟》角色与动画素材版权归原权利人，PRTS 资料遵循其适用许可。保留上游“个人学习、自用、请勿商业发布”的说明。
+- 此 Fork 继承原仓库的历史与安洁莉娜示例素材；未额外上传本机新增的凯尔希、斯卡蒂素材、虚拟环境、日志、设置或聊天记录。
+- 如需商用、在 GitHub 以外分发素材或重新授权，请先获得对应权利人的许可。
 
-欢迎提交 PR 修复 PRTS 页面变动、增加新动画映射、优化抽帧速度或补充平台适配。
+详见 [NOTICE.md](NOTICE.md)。
