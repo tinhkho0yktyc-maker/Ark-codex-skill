@@ -15,6 +15,23 @@ ANIMATIONS = ["Default", "Interact", "Move", "Relax", "Sit", "Sleep"]
 LOAD_BTN = "\u70b9\u6b64\u8f7d\u5165\u6a21\u578b"
 JIANJI = "\u57fa\u5efa"
 
+# Generic video/webm can select AV1 in Chromium: alpha_mode may still be set
+# even though no alpha packets are encoded. VP9 supports the actual alpha plane.
+ALPHA_RECORDER = """
+(() => {
+    const NativeRecorder = window.MediaRecorder;
+    const mimeType = 'video/webm;codecs=vp9';
+    if (!NativeRecorder || !NativeRecorder.isTypeSupported(mimeType)) {
+        throw new Error('Transparent VP9 WebM export is unavailable in this browser.');
+    }
+    window.MediaRecorder = class AlphaRecorder extends NativeRecorder {
+        constructor(stream, options = {}) {
+            super(stream, { videoBitsPerSecond: 12000000, ...options, mimeType });
+        }
+    };
+})();
+"""
+
 
 def find_chrome():
     candidates = [
@@ -97,6 +114,7 @@ def run_export(operator, skin, out_dir):
                 "Chrome/126.0.0.0 Safari/537.36"
             ),
         )
+        context.add_init_script(ALPHA_RECORDER)
         page = context.new_page()
         try:
             open_operator_page(page, operator)
@@ -111,15 +129,24 @@ def run_export(operator, skin, out_dir):
             select_option(page, model_select, JIANJI)
 
             skin_label = skin or "\u9ed8\u8ba4"
+            encoder_warmed = False
             for anim in ANIMATIONS:
                 anim_select = page.locator(".n-select").nth(2)
                 select_option(page, anim_select, anim)
                 page.wait_for_timeout(2000)
                 download = find_download_button(page)
+                if anim != "Default" and not encoder_warmed:
+                    # Chromium's first VP9 recording can miss the opening frames
+                    # while initializing its encoder. Discard that warm-up take.
+                    print("warming up transparent encoder", flush=True)
+                    with page.expect_download(timeout=120000) as warmup:
+                        download.click()
+                    warmup.value
+                    encoder_warmed = True
                 with page.expect_download(timeout=120000) as info:
                     download.click()
                 dl = info.value
-                ext = os.path.splitext(dl.suggested_filename())[1] or ".webm"
+                ext = os.path.splitext(dl.suggested_filename)[1] or ".webm"
                 out_path = os.path.join(
                     out_dir, f"{operator}-{skin_label}-基建-{anim}-x1{ext}"
                 )
