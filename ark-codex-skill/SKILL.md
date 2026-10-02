@@ -57,6 +57,7 @@ Restart the project, select the pet through the 桌宠库 menu and verify visibl
 - Automatic rest starts after about 40–60 seconds and sleep after 90 seconds. Manual states take precedence.
 - Roaming is optional and starts disabled. Walking/idle transitions blend for 140ms and retain facing; only automatic roaming idle caps long source holds at 120ms. Manual and other playback retain native timing. Roaming pauses for interaction, dragging, menus and rest.
 - The playback cap defaults to 60fps, but old 20fps assets cannot gain frames without reconversion.
+- Automatic movement keeps floating-point coordinates and compensates the native client pixel origin for DPI rounding. Pet and subtitle share a cached premultiplied layer with bilinear motion filtering. A separate screen-informed motion timer does not alter the animation frame cap or source assets; do not claim strict vertical synchronization.
 - The Codex monitor reads rollout logs under CODEX_HOME/sessions or the default ~/.codex/sessions; it does not change Codex data.
 - Autostart is optional and starts disabled. Only enable it or create shortcuts when requested. The watcher shows the pet and tray while Codex/ChatGPT is running, with project-scoped single-instance guards and crash backoff.
 - Tray Exit ends normal supervision; do not bypass a user's deliberate hide or exit choice.
