@@ -33,6 +33,8 @@ Resolve the exact PRTS operator page and choose the requested skin and 基建 mo
 
 Read [references/prts-ui.md](references/prts-ui.md) when manual export or selector repair is needed. Preserve any supplied source WebM files.
 
+The exporter explicitly selects VP9 to retain real alpha and discards a first warm-up take to avoid encoder startup gaps. A generic Chromium WebM export can select AV1 and carry an alpha_mode tag without alpha packets. If dark details disappear after black-background recovery, re-export transparently rather than accepting the damaged approximation. Keep the supplied originals and validate decoded alpha, not only container tags.
+
 Convert and validate:
 
 ```powershell
@@ -53,7 +55,7 @@ Restart the project, select the pet through the 桌宠库 menu and verify visibl
 - Per-pet position, scale and animation speed are remembered.
 - Subtitle width is independent of pet scale; hovering reveals full local task information.
 - Automatic rest starts after about 40–60 seconds and sleep after 90 seconds. Manual states take precedence.
-- Roaming is optional and starts disabled. It pauses for interaction, dragging, menus and rest.
+- Roaming is optional and starts disabled. Walking/idle transitions blend for 140ms and retain facing; only automatic roaming idle caps long source holds at 120ms. Manual and other playback retain native timing. Roaming pauses for interaction, dragging, menus and rest.
 - The playback cap defaults to 60fps, but old 20fps assets cannot gain frames without reconversion.
 - The Codex monitor reads rollout logs under CODEX_HOME/sessions or the default ~/.codex/sessions; it does not change Codex data.
 - Autostart is optional and starts disabled. Only enable it or create shortcuts when requested. The watcher shows the pet and tray while Codex/ChatGPT is running, with project-scoped single-instance guards and crash backoff.
