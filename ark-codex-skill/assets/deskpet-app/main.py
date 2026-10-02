@@ -60,6 +60,8 @@ STATUS_BAR_FULL_W = 720
 POSITION_FORMAT = "pet_bottom_center_v1"
 MIN_SCALE = 0.3
 MAX_SCALE = 2.0
+ROAM_TRANSITION_SECONDS = 0.14
+ROAM_IDLE_MAX_HOLD_MS = 120
 
 SPEED_OPTIONS = [
     ("0.5x", 0.5),
@@ -330,6 +332,7 @@ class StatusWorker(QThread):
 class PetWindow(QWidget):
     def __init__(self):
         super().__init__()
+        self.setWindowTitle("明日方舟桌宠")
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
         )
@@ -383,6 +386,11 @@ class PetWindow(QWidget):
         self.roam_until = 0
         self.next_roam_at = time.monotonic() + random.uniform(3, 6)
         self.roam_fraction = [0.0, 0.0]
+        self.roam_facing_left = False
+        self.roam_idle_timing = None
+        self.transition_image = None
+        self.transition_frame = None
+        self.transition_started_at = 0.0
         self.last_tick = time.monotonic()
         self.last_activity = self.last_tick
         self.auto_sit_after = random.uniform(40, 60)
@@ -582,26 +590,59 @@ class PetWindow(QWidget):
     def set_state(self, name, hold=False, manual=False):
         if name not in MANIFEST["states"]:
             return
+        now = time.monotonic()
+        self.transition_image = None
+        if (self.roaming_enabled and not manual and not self.manual_state
+                and name != self.state and {name, self.state} == {"idle", "move"}):
+            previous = self.current_image()
+            if not previous.isNull():
+                info = self.state_info(self.state)
+                offsets = info.get("frame_offsets")
+                offset = offsets[self.frame_index] if offsets else info.get("offset", (0, 0))
+                self.transition_image = previous
+                self.transition_frame = (info["bbox"], offset, self.roam_facing_left)
+                self.transition_started_at = now
         self.state = name
         self.hold_state = hold
         self.manual_state = manual
         self.frame_index = 0
-        self.anim_started_at = time.monotonic()
+        self.anim_started_at = now
         self.cache.clear()
         self.cache_bytes = 0
         if name != "move":
             self.roam_direction = (0, 0)
+        elif self.roam_direction != (0, 0):
+            self.roam_facing_left = self.roam_direction[0] < 0
+        if manual or name not in ("idle", "move"):
+            self.roam_facing_left = False
         self.apply_geometry()
         self.update()
 
     def duration_ms(self):
+        return self.playback_timing()[1]
+
+    def playback_timing(self):
         info = self.state_info(self.state)
-        return max(1, info.get("duration", info["count"] * 1000 / FPS))
+        times = info.get("frame_times_ms")
+        duration = max(1, info.get("duration", info["count"] * 1000 / FPS))
+        # A recording can intentionally hold a Relax pose for over a second.
+        # Keep native timing everywhere except automatic roaming's idle pauses.
+        if self.state == "idle" and self.roaming_enabled and not self.manual_state and times:
+            cached = self.roam_idle_timing
+            if cached is None or cached[0] is not info:
+                paced = [times[0]]
+                for first, second in zip(times, times[1:]):
+                    paced.append(paced[-1] + min(second - first, ROAM_IDLE_MAX_HOLD_MS))
+                paced_duration = paced[-1] + min(max(1, duration - times[-1]), ROAM_IDLE_MAX_HOLD_MS)
+                self.roam_idle_timing = (info, paced, paced_duration)
+            return self.roam_idle_timing[1:]
+        return times, duration
 
     def stop_roaming(self):
         if self.roam_direction != (0, 0):
-            self.roam_direction = (0, 0)
             self.set_state("idle")
+        self.roam_direction = (0, 0)
+        self.roam_fraction = [0.0, 0.0]
         self.next_roam_at = time.monotonic() + random.uniform(2, 5)
 
     def step_roaming(self, now, delta):
@@ -676,45 +717,74 @@ class PetWindow(QWidget):
         self.step_roaming(now, delta)
         info = self.state_info(self.state)
         elapsed = max(0, (now - self.anim_started_at) * 1000 * self.speed)
-        duration = self.duration_ms()
+        times, duration = self.playback_timing()
         if self.state in ("interact", "sit") and not self.hold_state and elapsed >= duration:
             self.set_state("idle")
             return
-        times = info.get("frame_times_ms")
         position = elapsed % duration
         if times:
             index = max(0, min(info["count"] - 1, bisect.bisect_right(times, position) - 1))
         else:
             index = min(info["count"] - 1, int(position * FPS / 1000))
-        if index != self.frame_index:
+        transitioning = self.transition_image is not None
+        if transitioning and now - self.transition_started_at >= ROAM_TRANSITION_SECONDS:
+            self.transition_image = None
+        if index != self.frame_index or transitioning:
             self.frame_index = index
             if self.isVisible():
                 self.update()
 
+    def draw_pet_frame(self, painter, image, bbox, offset, mirrored, opacity=1.0):
+        bx, _, bx2, by2 = bbox
+        scale = self.render_scale
+        target = QRectF(
+            self.width() / 2 + (offset[0] - (bx + bx2 + 1) / 2) * scale,
+            self.height() - PAD + (offset[1] - by2 - 1) * scale,
+            image.width() * scale, image.height() * scale,
+        )
+        painter.save()
+        painter.setOpacity(opacity)
+        if mirrored:
+            painter.translate(self.width(), 0)
+            painter.scale(-1, 1)
+        painter.drawImage(target, image)
+        painter.restore()
+
     def paintEvent(self, event):
         info = self.state_info(self.state)
-        bx, by, bx2, _ = info["bbox"]
         image = self.current_image()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        status_extra = STATUS_H if self.show_status else 0
         if not image.isNull():
-            scale = self.render_scale
-            pet_width = (bx2 - bx + 1) * scale
-            pet_left = (self.width() - pet_width) / 2
             offsets = info.get("frame_offsets")
-            offset_x, offset_y = offsets[self.frame_index] if offsets else info.get("offset", (0, 0))
-            target = QRectF(
-                pet_left + (offset_x - bx) * scale,
-                status_extra + PAD + (offset_y - by) * scale,
-                image.width() * scale,
-                image.height() * scale,
-            )
+            offset = offsets[self.frame_index] if offsets else info.get("offset", (0, 0))
+            mirrored = self.state in ("idle", "move") and self.roam_facing_left
+            progress = 1.0
+            if self.transition_image is not None:
+                progress = min(1.0, max(0.0, (time.monotonic() - self.transition_started_at) / ROAM_TRANSITION_SECONDS))
             painter.save()
-            if self.state == "move" and self.roam_direction[0] < 0:
-                painter.translate(self.width(), 0)
-                painter.scale(-1, 1)
-            painter.drawImage(target, image)
+            if progress < 1:
+                blended = QImage(self.size(), QImage.Format_ARGB32_Premultiplied)
+                blended.fill(Qt.transparent)
+                mixer = QPainter(blended)
+                mixer.setRenderHint(QPainter.SmoothPixmapTransform)
+                self.draw_pet_frame(mixer, self.transition_image, *self.transition_frame, opacity=1 - progress)
+                mixer.end()
+                incoming = QImage(self.size(), QImage.Format_ARGB32_Premultiplied)
+                incoming.fill(Qt.transparent)
+                next_painter = QPainter(incoming)
+                next_painter.setRenderHint(QPainter.SmoothPixmapTransform)
+                self.draw_pet_frame(next_painter, image, info["bbox"], offset, mirrored, progress)
+                next_painter.end()
+                # Weight each raster first, then add with full painter opacity.
+                # Qt's Plus + constant opacity otherwise brightens/fades the body.
+                mixer = QPainter(blended)
+                mixer.setCompositionMode(QPainter.CompositionMode_Plus)
+                mixer.drawImage(0, 0, incoming)
+                mixer.end()
+                painter.drawImage(0, 0, blended)
+            else:
+                self.draw_pet_frame(painter, image, info["bbox"], offset, mirrored)
             painter.restore()
 
         if self.show_status:
@@ -928,6 +998,10 @@ class PetWindow(QWidget):
             pet_state.get("speed", self.settings.get("speed", 1.0))
         )
         self.cache.clear()
+        self.roam_idle_timing = None
+        self.roam_facing_left = False
+        self.transition_image = None
+        self.state = "idle"
         self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.setInterval(self.tick_ms())
         self.note_activity()
