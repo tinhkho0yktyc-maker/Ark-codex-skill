@@ -22,6 +22,8 @@ Legacy PNGs occupy the full canvas and omit per-frame timestamps and offsets. Ke
 
 The player computes elapsed animation time from a monotonic clock and the user's animation speed, loops modulo duration, and selects the most recent frame timestamp not greater than that position. The 20/30/60fps UI setting caps redraws; it does not change source timestamps or action duration.
 
+Automatic roaming is a deliberate playback exception: idle frame holds above 120ms are capped in a separate in-memory timeline, and walking/idle images blend for 140ms. The source timestamps and manifest remain unchanged. Non-roaming and manually selected playback use the native timeline.
+
 Crop bounds include padding around pixels whose alpha exceeds 10. The union bbox is calculated before trimming, with inclusive right/bottom coordinates. Reconstruct frames using their offsets; do not independently resize crops or treat their top-left corners as the original canvas origin.
 
 Transparent WebM alpha should be preserved by libvpx/libvpx-vp9 decoding. Opaque-black recovery is explicit and approximate; never describe it as lossless alpha recovery.
