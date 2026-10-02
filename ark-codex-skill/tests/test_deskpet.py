@@ -21,7 +21,7 @@ sys.path.insert(0, str(PROJECT))
 import codex_monitor as monitor
 import process_support as support
 import main as pet
-from PySide6.QtCore import QThread, QRect, Signal
+from PySide6.QtCore import QThread, QRect, Signal, Qt
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
@@ -284,10 +284,58 @@ class AutostartTests(unittest.TestCase):
 
 
 class FakeScreen:
-    def __init__(self, rectangle):
+    def __init__(self, rectangle, refresh=60):
         self.rectangle = rectangle
+        self.refresh = refresh
     def availableGeometry(self):
         return self.rectangle
+    def geometry(self):
+        return self.rectangle
+    def refreshRate(self):
+        return self.refresh
+
+
+def alpha_centroid(image):
+    mass = horizontal = vertical = 0
+    for row in range(image.height()):
+        for column in range(image.width()):
+            alpha = image.pixelColor(column, row).alpha()
+            mass += alpha
+            horizontal += column * alpha
+            vertical += row * alpha
+    return horizontal / mass, vertical / mass
+
+
+class SubpixelTests(unittest.TestCase):
+    def test_physical_origin_maps_fractional_and_negative_screens(self):
+        mapping = pet.motion_support.map_native_origin
+        self.assertEqual(mapping((302, 450), (0, 0), (0, 0), 1.5), (302 / 1.5, 300))
+        self.assertEqual(mapping((-1800, 300), (-1920, 0), (-1920, 0), 1.5), (-1840, 200))
+
+    def test_pre_window_fallback_includes_physical_pixel_rounding(self):
+        mapping = pet.motion_support.quantized_origin
+        self.assertEqual(mapping((101, 203), (0, 0), 1.5), (304 / 3, 610 / 3))
+        self.assertEqual(mapping((-101, -203), (0, 0), 1.5), (-304 / 3, -610 / 3))
+
+    def test_layer_translation_is_fractional_not_a_rounded_image_blit(self):
+        source = QImage(64, 64, QImage.Format_ARGB32_Premultiplied)
+        source.fill(Qt.transparent)
+        painter = QPainter(source)
+        painter.fillRect(12, 8, 28, 10, QColor(40, 150, 70, 190))
+        painter.fillRect(22, 34, 18, 18, QColor(0, 0, 0, 255))
+        painter.end()
+        original = alpha_centroid(source)
+        for ratio in (1, 1.5, 2):
+            source.setDevicePixelRatio(ratio)
+            for offset in ((0.25, 0.35), (-0.3, 0.4), (0.6, -0.25)):
+                shifted = pet.motion_support.shift_layer(source, offset, ratio)
+                center = alpha_centroid(shifted)
+                self.assertAlmostEqual(center[0] - original[0], offset[0] * ratio, delta=0.025)
+                self.assertAlmostEqual(center[1] - original[1], offset[1] * ratio, delta=0.025)
+                self.assertEqual(shifted.devicePixelRatioF(), ratio)
+                self.assertEqual(shifted.pixelColor(29, 42).getRgb(), (0, 0, 0, 255))
+                self.assertEqual(shifted.pixelColor(25, 12).alpha(), 190)
+        self.assertEqual(alpha_centroid(source), original)
 
 
 
@@ -359,10 +407,11 @@ class WindowTests(unittest.TestCase):
         for change in self.patches:
             change.start()
         self.window = pet.PetWindow()
-        for timer in (self.window.timer, self.window.status_timer, self.window.fullscreen_timer):
+        for timer in (self.window.timer, self.window.status_timer, self.window.fullscreen_timer, self.window.motion_timer):
             timer.stop()
 
     def tearDown(self):
+        self.window.motion_timer.stop()
         self.window.stop_worker()
         self.window.hide()
         try:
@@ -616,6 +665,95 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(w.pet_name, "测试角色B")
         self.assertGreater(w.last_activity, 0)
         self.assertFalse(w.current_image().isNull())
+
+    def test_roaming_preserves_less_than_one_pixel_displacements(self):
+        w = self.window
+        w.roaming_enabled = True
+        w.roaming_speed = 55
+        w.roam_direction = (1, 0.35)
+        w.roam_until = 110
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.note_activity()
+            w.set_state("move")
+            w.move_precisely(250, 250)
+            w.step_roaming(100, 0)
+        for tick in range(1, 13):
+            now = 100 + tick * 0.006
+            with patch.object(pet.time, "monotonic", lambda: now):
+                w.next_motion()
+            self.assertAlmostEqual(w.content_origin()[0], 250 + tick * 0.006 * 55, places=8)
+            self.assertAlmostEqual(w.content_origin()[1], 250 + tick * 0.006 * 55 * 0.35, places=8)
+        self.assertEqual(w.state, "move")
+
+    def test_animation_tick_does_not_integrate_motion_a_second_time(self):
+        w = self.window
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.note_activity()
+            w.roaming_enabled = True
+            w.roam_direction = (1, 0)
+            w.set_state("move")
+            w.roam_until = 110
+        before = w.content_origin()
+        with patch.object(pet.time, "monotonic", lambda: 100.017):
+            w.next_frame()
+        self.assertEqual(w.content_origin(), before)
+        self.assertTrue(w.motion_timer.isActive())
+        w.set_state("sleep", hold=True, manual=True)
+        self.assertFalse(w.motion_timer.isActive())
+
+    def test_motion_cadence_is_separate_from_animation_frame_cap(self):
+        w = self.window
+        screen = FakeScreen(QRect(0, 0, 1920, 1080), refresh=165)
+        with patch.object(w, "layout_screen", lambda: screen):
+            w.playback_fps = 20
+            self.assertEqual(w.tick_ms(), 50)
+            self.assertEqual(w.motion_tick_ms(), 6)
+
+    def test_whole_layer_cache_is_reused_for_motion_and_invalidated_for_text(self):
+        w = self.window
+        first = w.compose_layer()
+        origin = w.content_origin()
+        w.move_precisely(origin[0] + 0.3, origin[1] + 0.4)
+        self.assertIs(w.compose_layer(), first)
+        w.status_text = "new subtitle"
+        self.assertIsNot(w.compose_layer(), first)
+
+    def test_caption_and_pet_share_the_same_150_percent_compensation(self):
+        w = self.window
+        with patch.object(w, "devicePixelRatioF", lambda: 1.5), \
+             patch.object(w, "native_origin", lambda screen=None: pet.motion_support.quantized_origin((w.x(), w.y()), (0, 0), 1.5)):
+            w.move_precisely(250, 250)
+            layer = w.compose_layer()
+            before = alpha_centroid(layer)
+            self.assertEqual(layer.width(), round(w.width() * 1.5))
+            w.move_precisely(250.25, 250.35)
+            offset = w.content_offset()
+            shifted = pet.motion_support.shift_layer(layer, offset, 1.5)
+            after = alpha_centroid(shifted)
+            self.assertAlmostEqual(after[0] - before[0], 0.25 * 1.5, delta=0.025)
+            self.assertAlmostEqual(after[1] - before[1], 0.35 * 1.5, delta=0.025)
+
+    def test_fractional_anchor_survives_action_switch_and_settings_save(self):
+        w = self.window
+        w.move_precisely(250.2, 250.4)
+        anchor = (w.content_origin()[0] + w.width() / 2, w.content_origin()[1] + w.height())
+        w.set_state("sleep", hold=True, manual=True)
+        self.assertAlmostEqual(w.content_origin()[0] + w.width() / 2, anchor[0], places=8)
+        self.assertAlmostEqual(w.content_origin()[1] + w.height(), anchor[1], places=8)
+        w.save_pet_state()
+        saved = pet.load_settings()["pet_states"][w.pet_name]
+        self.assertEqual((saved["anchor_x"], saved["anchor_y"]), tuple(round(value, 3) for value in anchor))
+
+    def test_screen_boundary_does_not_discard_interior_fractional_motion(self):
+        w = self.window
+        screen = FakeScreen(QRect(-1920, -100, 1920, 1080))
+        with patch.object(w, "layout_screen", lambda: screen):
+            w.move_precisely(-900.2, 400.35, screen)
+            origin = w.content_origin()
+            w.constrain_to_screen(screen)
+            self.assertEqual(w.content_origin(), origin)
+            w.move_precisely(-9999, 9999, screen)
+            self.assertEqual(w.content_origin(), (-1920.0, float(980 - w.height())))
 
     def test_render_contact_preview(self):
         w = self.window
