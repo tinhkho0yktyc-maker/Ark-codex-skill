@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
-PROJECT = Path(__file__).resolve().parents[1] / "assets" / "deskpet-app"
+PROJECT = Path(os.environ.get("ARK_DESKPET_TEST_PROJECT", str(Path(__file__).resolve().parents[1] / "assets" / "deskpet-app")))
 import sys
 sys.path.insert(0, str(PROJECT))
 
@@ -526,6 +526,88 @@ class WindowTests(unittest.TestCase):
         w.set_state("sleep", hold=True, manual=True)
         w.receive_status({"active": True})
         self.assertEqual(w.state, "sleep")
+
+    def test_roaming_stops_on_the_same_tick_and_keeps_facing(self):
+        w = self.window
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.note_activity()
+            w.roaming_enabled = True
+            w.roam_direction = (-1, 0)
+            w.set_state("move")
+            w.frame_index = 8
+            w.roam_until = 100.2
+        with patch.object(pet.time, "monotonic", lambda: 100.21):
+            w.next_frame()
+        self.assertEqual(w.state, "idle")
+        self.assertEqual(w.roam_direction, (0, 0))
+        self.assertTrue(w.roam_facing_left)
+        self.assertIsNotNone(w.transition_image)
+        self.assertEqual(w.transition_frame[2], True)
+        self.assertEqual(w.frame_index, 0)
+
+    def test_roaming_idle_caps_long_holds_without_mutating_native_timing(self):
+        w = self.window
+        info = w.state_info("idle")
+        original = [0, 17, 34, 1350, 1367]
+        info.update(frame_times_ms=original[:], duration=1400, count=5)
+        w.roaming_enabled = True
+        w.manual_state = False
+        self.assertEqual(w.playback_timing(), ([0, 17, 34, 154, 171], 204))
+        w.anim_started_at = w.last_activity = 100
+        w.next_roam_at = 110
+        with patch.object(pet.time, "monotonic", lambda: 100.18):
+            w.next_frame()
+        self.assertEqual(w.frame_index, 4)
+        self.assertEqual(info["frame_times_ms"], original)
+        w.manual_state = True
+        self.assertEqual(w.playback_timing(), (original, 1400))
+        w.manual_state = False
+        w.roaming_enabled = False
+        self.assertEqual(w.playback_timing(), (original, 1400))
+
+    def test_roaming_crossfade_finishes_and_manual_choice_clears_it(self):
+        w = self.window
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.note_activity()
+            w.roaming_enabled = True
+            w.roam_direction = (1, 0)
+            w.set_state("move")
+            w.stop_roaming()
+        with patch.object(w, "update") as update, patch.object(pet.time, "monotonic", lambda: 100.04):
+            w.next_frame()
+            self.assertTrue(update.called)
+            self.assertIsNotNone(w.transition_image)
+        with patch.object(pet.time, "monotonic", lambda: 100.2):
+            w.next_frame()
+        self.assertIsNone(w.transition_image)
+        w.set_state("move")
+        self.assertIsNotNone(w.transition_image)
+        w.set_state("idle", hold=True, manual=True)
+        self.assertIsNone(w.transition_image)
+        self.assertFalse(w.roam_facing_left)
+
+    def test_roaming_crossfade_does_not_make_the_body_transparent(self):
+        w = self.window
+        w.show_status = False
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.note_activity()
+            w.roaming_enabled = True
+            w.roam_direction = (1, 0)
+            w.set_state("move")
+            w.stop_roaming()
+        with patch.object(pet.time, "monotonic", lambda: 100.07):
+            image = w.grab().toImage()
+        self.assertGreaterEqual(image.pixelColor(image.width() // 2, image.height() - pet.PAD - 20).alpha(), 250)
+
+    def test_switching_pet_drops_the_old_roaming_transition(self):
+        w = self.window
+        w.roaming_enabled = True
+        w.roam_direction = (-1, 0)
+        w.set_state("move")
+        w.select_pet("测试角色B")
+        self.assertEqual(w.state, "idle")
+        self.assertIsNone(w.transition_image)
+        self.assertFalse(w.roam_facing_left)
 
     def test_selecting_pet_resets_idle_clock(self):
         w = self.window

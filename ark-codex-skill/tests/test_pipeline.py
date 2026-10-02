@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +20,7 @@ sys.path.insert(0, str(SCRIPTS))
 import process_webm as converter
 import scaffold_deskpet as scaffold
 import setup_env
+import prts_export
 
 
 class PipelineTests(unittest.TestCase):
@@ -124,6 +126,61 @@ class PipelineTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg/ffprobe required")
 class NativeConversionTests(unittest.TestCase):
+    @unittest.skipUnless(prts_export.find_chrome(), "System Chrome/Edge required")
+    def test_browser_export_preserves_true_alpha_and_black_artwork(self):
+        from playwright.sync_api import sync_playwright
+        with tempfile.TemporaryDirectory() as temporary, sync_playwright() as playwright:
+            root = Path(temporary)
+            browser = playwright.chromium.launch(executable_path=prts_export.find_chrome(), headless=True)
+            try:
+                context = browser.new_context()
+                context.add_init_script(prts_export.ALPHA_RECORDER)
+                page = context.new_page()
+                page.goto("data:text/html," + urllib.parse.quote('<canvas id="fixture" width="64" height="64"></canvas>'))
+                result = page.evaluate("""async () => {
+                    const canvas = document.getElementById('fixture');
+                    const ctx = canvas.getContext('2d');
+                    ctx.fillStyle = 'green';
+                    ctx.fillRect(16, 16, 32, 32);
+                    const recorder = new MediaRecorder(canvas.captureStream(30), {mimeType: 'video/webm'});
+                    const chunks = [];
+                    recorder.ondataavailable = event => chunks.push(event.data);
+                    const started = new Promise(resolve => recorder.onstart = resolve);
+                    const stopped = new Promise(resolve => recorder.onstop = resolve);
+                    recorder.start();
+                    await started;
+                    for (let index = 0; index < 24; index++) {
+                        ctx.clearRect(0, 0, 64, 64);
+                        ctx.fillStyle = `rgb(${40 + index * 3},160,80)`;
+                        ctx.fillRect(16, 16, 32, 32);
+                        ctx.fillStyle = 'black';
+                        ctx.fillRect(24, 24, 12, 12);
+                        await new Promise(resolve => setTimeout(resolve, 40));
+                    }
+                    recorder.stop();
+                    await stopped;
+                    return {mime: recorder.mimeType, bytes: Array.from(new Uint8Array(await new Blob(chunks).arrayBuffer()))};
+                }""")
+                self.assertIn("vp9", result["mime"].lower())
+                source = root / "browser-alpha.webm"
+                source.write_bytes(bytes(result["bytes"]))
+            finally:
+                browser.close()
+            try:
+                stream, times, duration = converter.probe(source)
+            except subprocess.CalledProcessError as error:
+                self.fail(f"Browser produced {source.stat().st_size} bytes: {error.stderr.decode(errors='replace')}")
+            self.assertEqual(stream["codec_name"], "vp9")
+            self.assertGreater(len(times), 2)
+            offsets, bbox, count = converter.decode_state(source, root / "frames", stream, times, False)
+            self.assertEqual(count, len(times))
+            with Image.open(root / "frames/frame_0000.png") as image:
+                self.assertEqual(image.getpixel((0, 0))[3], 0)
+            with Image.open(root / f"frames/frame_{count - 1:04d}.png") as image:
+                black = image.getpixel((29 - offsets[-1][0], 29 - offsets[-1][1]))
+                self.assertGreaterEqual(black[3], 250)
+                self.assertLess(max(black[:3]), 10)
+
     def test_real_alpha_webm_round_trip_and_failed_staging_cleanup(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
