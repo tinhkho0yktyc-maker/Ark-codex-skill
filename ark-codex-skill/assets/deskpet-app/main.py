@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 import autostart_support
 import codex_monitor
+import motion_support
 from process_support import InstanceGuard, atomic_json, log, remove_identity, write_identity
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -385,7 +386,13 @@ class PetWindow(QWidget):
         self.roam_direction = (0, 0)
         self.roam_until = 0
         self.next_roam_at = time.monotonic() + random.uniform(3, 6)
-        self.roam_fraction = [0.0, 0.0]
+        self._world_target = None
+        self._world_widget = None
+        self._in_position_move = False
+        self._screen_refresh_pending = False
+        self._layer_cache = None
+        self._layer_cache_key = None
+        self.last_motion_tick = time.monotonic()
         self.roam_facing_left = False
         self.roam_idle_timing = None
         self.transition_image = None
@@ -412,6 +419,10 @@ class PetWindow(QWidget):
         self.status_text = "Codex 待机"
         self.status_active = False
         self.tray_hidden = False
+
+        self.motion_timer = QTimer(self)
+        self.motion_timer.setTimerType(Qt.PreciseTimer)
+        self.motion_timer.timeout.connect(self.next_motion)
 
         self.timer = QTimer(self)
         self.timer.setTimerType(Qt.PreciseTimer)
@@ -460,11 +471,74 @@ class PetWindow(QWidget):
         self.screen_changed()
 
     def screen_changed(self, *args):
+        if self._in_position_move:
+            if not self._screen_refresh_pending:
+                self._screen_refresh_pending = True
+                QTimer.singleShot(0, self.screen_changed)
+            return
+        self._screen_refresh_pending = False
         self.apply_geometry()
+        if self.motion_timer.isActive():
+            self.motion_timer.setInterval(self.motion_tick_ms())
         self.update()
 
     def tick_ms(self):
         return max(8, round(1000 / self.playback_fps))
+
+    def motion_tick_ms(self):
+        screen = self.layout_screen()
+        refresh = getattr(screen, "refreshRate", lambda: 60)() if screen else 60
+        if not math.isfinite(refresh) or refresh <= 0:
+            refresh = 60
+        return max(5, round(1000 / min(180, max(60, refresh))))
+
+    def native_origin(self, screen=None):
+        handle = self.windowHandle()
+        screen = screen or (handle.screen() if handle else None) or self.layout_screen()
+        area = screen.geometry() if screen and hasattr(screen, "geometry") else (screen.availableGeometry() if screen else QRect())
+        origin = (area.x(), area.y())
+        ratio = max(1e-6, self.devicePixelRatioF())
+        native = motion_support.native_client_origin(int(self.winId()), origin, ratio) if handle else None
+        return native if native is not None else motion_support.quantized_origin((self.x(), self.y()), origin, ratio)
+
+    def content_origin(self, screen=None):
+        position = (self.x(), self.y())
+        if self._world_target is None or (position != self._world_widget and not self._in_position_move):
+            self._world_target = self.native_origin(screen)
+            self._world_widget = position
+        return self._world_target
+
+    def content_offset(self):
+        desired = self.content_origin()
+        actual = self.native_origin()
+        return desired[0] - actual[0], desired[1] - actual[1]
+
+    def move_precisely(self, left, top, screen=None, immediate=False):
+        screen = screen or self.layout_screen()
+        if screen:
+            area = screen.availableGeometry()
+            left = max(area.x(), min(left, area.x() + max(0, area.width() - self.width())))
+            top = max(area.y(), min(top, area.y() + max(0, area.height() - self.height())))
+        self._world_target = (float(left), float(top))
+        self._in_position_move = True
+        try:
+            self.move(round(left), round(top))
+        finally:
+            self._in_position_move = False
+        self._world_widget = (self.x(), self.y())
+        # Flush motion compensation in this callback; do not leave the old
+        # backing image visible at a newly moved native window position.
+        if immediate and self.isVisible():
+            self.repaint()
+        else:
+            self.update()
+        return self._world_target
+
+    def next_motion(self):
+        now = time.monotonic()
+        delta = min(0.1, max(0, now - self.last_motion_tick))
+        self.last_motion_tick = now
+        self.step_roaming(now, delta)
 
     def state_info(self, name):
         return MANIFEST["states"][name]
@@ -502,10 +576,10 @@ class PetWindow(QWidget):
         area = screen.availableGeometry()
         max_x = area.x() + max(0, area.width() - self.width())
         max_y = area.y() + max(0, area.height() - self.height())
-        self.move(
-            max(area.x(), min(self.x(), max_x)),
-            max(area.y(), min(self.y(), max_y)),
-        )
+        left, top = self.content_origin(screen)
+        constrained = (max(area.x(), min(left, max_x)), max(area.y(), min(top, max_y)))
+        if constrained != (left, top):
+            self.move_precisely(*constrained, screen=screen)
 
     def restore_position(self, pet_state):
         anchor_x = pet_state.get("anchor_x")
@@ -528,10 +602,8 @@ class PetWindow(QWidget):
                 QGuiApplication.screenAt(anchor_point)
                 or QGuiApplication.primaryScreen()
             )
-            self.move(
-                int(float(anchor_x) - self.width() / 2),
-                int(float(anchor_y) - self.height()),
-            )
+            self.move_precisely(float(anchor_x) - self.width() / 2,
+                                float(anchor_y) - self.height(), screen=screen)
             self.apply_geometry(screen=screen)
             return
 
@@ -539,9 +611,10 @@ class PetWindow(QWidget):
         if screen is None:
             return
         area = screen.availableGeometry()
-        self.move(
+        self.move_precisely(
             area.x() + (area.width() - self.width()) // 2,
             area.y() + area.height() - self.height(),
+            screen=screen,
         )
 
     def apply_geometry(self, screen=None):
@@ -554,8 +627,9 @@ class PetWindow(QWidget):
             self._applying_geometry = False
 
     def _apply_geometry(self, screen=None):
-        old_center = self.x() + self.width() / 2
-        old_bottom = self.y() + self.height()
+        old_left, old_top = self.content_origin(screen)
+        old_center = old_left + self.width() / 2
+        old_bottom = old_top + self.height()
         screen = screen or self.layout_screen()
         if screen is None:
             return
@@ -572,13 +646,13 @@ class PetWindow(QWidget):
         width = max(pet_width + PAD * 2, self.status_bar_width(screen) + 12 if self.show_status else 0)
         height = pet_height + PAD * 2 + status_extra
         self.resize(width, height)
-        self.move(round(old_center - width / 2), round(old_bottom - height))
+        self.move_precisely(old_center - width / 2, old_bottom - height, screen=screen)
         self.constrain_to_screen(screen)
         pet_left = (width - pet_width) // 2
         region = QRegion(QRect(pet_left - 3, status_extra + PAD - 3, pet_width + 6, pet_height + 6))
         if self.show_status:
             bar_width = self.status_bar_width(screen)
-            region |= QRegion(QRect((width - bar_width) // 2, 4, bar_width, STATUS_H - 8))
+            region |= QRegion(QRect((width - bar_width) // 2, 4, bar_width, STATUS_H - 8).adjusted(-2, -2, 2, 2))
         self.setMask(region)
 
     def note_activity(self):
@@ -611,6 +685,7 @@ class PetWindow(QWidget):
         self.cache_bytes = 0
         if name != "move":
             self.roam_direction = (0, 0)
+            self.motion_timer.stop()
         elif self.roam_direction != (0, 0):
             self.roam_facing_left = self.roam_direction[0] < 0
         if manual or name not in ("idle", "move"):
@@ -642,13 +717,15 @@ class PetWindow(QWidget):
         if self.roam_direction != (0, 0):
             self.set_state("idle")
         self.roam_direction = (0, 0)
-        self.roam_fraction = [0.0, 0.0]
+        self.motion_timer.stop()
         self.next_roam_at = time.monotonic() + random.uniform(2, 5)
 
     def step_roaming(self, now, delta):
         if not self.roaming_enabled or self.drag or self.menu_open or self.press_global is not None or self.manual_state or not self.isVisible():
+            self.motion_timer.stop()
             return
         if self.state not in ("idle", "move"):
+            self.motion_timer.stop()
             return
         if self.roam_direction == (0, 0):
             if now < self.next_roam_at:
@@ -656,21 +733,21 @@ class PetWindow(QWidget):
             angle = random.uniform(0, math.tau)
             self.roam_direction = (math.cos(angle), math.sin(angle) * 0.35)
             self.roam_until = now + random.uniform(3, 6)
-            self.roam_fraction = [0.0, 0.0]
             self.set_state("move")
         if now >= self.roam_until:
             self.stop_roaming()
             return
-        old_position = self.pos()
+        if not self.motion_timer.isActive():
+            self.last_motion_tick = now
+            self.motion_timer.start(self.motion_tick_ms())
+        if delta <= 0:
+            return
+        old_position = self.content_origin()
         dx, dy = self.roam_direction
-        self.roam_fraction[0] += dx * self.roaming_speed * delta
-        self.roam_fraction[1] += dy * self.roaming_speed * delta
-        step_x, step_y = int(self.roam_fraction[0]), int(self.roam_fraction[1])
-        self.roam_fraction[0] -= step_x
-        self.roam_fraction[1] -= step_y
-        self.move(self.x() + step_x, self.y() + step_y)
-        self.constrain_to_screen()
-        if (step_x or step_y) and self.pos() == old_position:
+        moved = self.move_precisely(old_position[0] + dx * self.roaming_speed * delta,
+                                    old_position[1] + dy * self.roaming_speed * delta,
+                                    immediate=True)
+        if (dx or dy) and moved == old_position:
             self.stop_roaming()
 
     def toggle_roaming(self):
@@ -714,7 +791,9 @@ class PetWindow(QWidget):
                 self.set_state("sleep", hold=True)
             elif age >= self.auto_sit_after and self.state not in ("sit", "sleep"):
                 self.set_state("sit", hold=True)
-        self.step_roaming(now, delta)
+        # This timer chooses animation frames and schedules roaming states only.
+        # The independent motion timer integrates displacement exactly once.
+        self.step_roaming(now, 0)
         info = self.state_info(self.state)
         elapsed = max(0, (now - self.anim_started_at) * 1000 * self.speed)
         times, duration = self.playback_timing()
@@ -750,11 +829,26 @@ class PetWindow(QWidget):
         painter.drawImage(target, image)
         painter.restore()
 
-    def paintEvent(self, event):
+    def create_surface(self):
+        ratio = max(1e-6, self.devicePixelRatioF())
+        surface = QImage(math.ceil(self.width() * ratio), math.ceil(self.height() * ratio), QImage.Format_ARGB32_Premultiplied)
+        surface.setDevicePixelRatio(ratio)
+        surface.fill(Qt.transparent)
+        return surface
+
+    def compose_layer(self):
+        key = (self.pet_name, self.state, self.frame_index, self.width(), self.height(),
+               self.render_scale, self.roam_facing_left, self.show_status,
+               self.status_text, self.status_active, self.subtitle_size, self.bar_length,
+               self.devicePixelRatioF())
+        if self.transition_image is None and self._layer_cache_key == key:
+            return self._layer_cache
+        layer = self.create_surface()
         info = self.state_info(self.state)
         image = self.current_image()
-        painter = QPainter(self)
+        painter = QPainter(layer)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.Antialiasing)
         if not image.isNull():
             offsets = info.get("frame_offsets")
             offset = offsets[self.frame_index] if offsets else info.get("offset", (0, 0))
@@ -764,14 +858,12 @@ class PetWindow(QWidget):
                 progress = min(1.0, max(0.0, (time.monotonic() - self.transition_started_at) / ROAM_TRANSITION_SECONDS))
             painter.save()
             if progress < 1:
-                blended = QImage(self.size(), QImage.Format_ARGB32_Premultiplied)
-                blended.fill(Qt.transparent)
+                blended = self.create_surface()
                 mixer = QPainter(blended)
                 mixer.setRenderHint(QPainter.SmoothPixmapTransform)
                 self.draw_pet_frame(mixer, self.transition_image, *self.transition_frame, opacity=1 - progress)
                 mixer.end()
-                incoming = QImage(self.size(), QImage.Format_ARGB32_Premultiplied)
-                incoming.fill(Qt.transparent)
+                incoming = self.create_surface()
                 next_painter = QPainter(incoming)
                 next_painter.setRenderHint(QPainter.SmoothPixmapTransform)
                 self.draw_pet_frame(next_painter, image, info["bbox"], offset, mirrored, progress)
@@ -811,6 +903,16 @@ class PetWindow(QWidget):
                 Qt.AlignVCenter | Qt.AlignLeft,
                 elided,
             )
+        painter.end()
+        self._layer_cache = layer
+        self._layer_cache_key = key if self.transition_image is None else None
+        return layer
+
+    def paintEvent(self, event):
+        layer = motion_support.shift_layer(self.compose_layer(), self.content_offset(), self.devicePixelRatioF())
+        painter = QPainter(self)
+        painter.drawImage(0, 0, layer)
+        painter.end()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -826,7 +928,7 @@ class PetWindow(QWidget):
 
     def mouseMoveEvent(self, event):
         bar_width = self.status_bar_width()
-        bar = QRectF((self.width() - bar_width) / 2, 4, bar_width, STATUS_H - 8)
+        bar = QRectF((self.width() - bar_width) / 2, 4, bar_width, STATUS_H - 8).translated(*self.content_offset())
         if self.show_status and bar.contains(event.position()):
             QToolTip.showText(event.globalPosition().toPoint(), self.full_status_text, self)
         else:
@@ -1013,6 +1115,7 @@ class PetWindow(QWidget):
 
     def save_pet_state(self):
         disk = load_settings()
+        left, top = self.content_origin()
         self.settings["autostart_with_codex"] = disk.get("autostart_with_codex", False)
         pet_states = self.settings.setdefault("pet_states", {})
         pet_states[self.pet_name] = {
@@ -1020,15 +1123,15 @@ class PetWindow(QWidget):
             "speed": self.speed,
             "pos_x": self.x(),
             "pos_y": self.y(),
-            "anchor_x": int(self.x() + self.width() / 2),
-            "anchor_y": self.y() + self.height(),
+            "anchor_x": round(left + self.width() / 2, 3),
+            "anchor_y": round(top + self.height(), 3),
             "position_format": POSITION_FORMAT,
         }
         self.settings["scale"] = self.scale
         self.settings["pos_x"] = self.x()
         self.settings["pos_y"] = self.y()
-        self.settings["anchor_x"] = int(self.x() + self.width() / 2)
-        self.settings["anchor_y"] = self.y() + self.height()
+        self.settings["anchor_x"] = round(left + self.width() / 2, 3)
+        self.settings["anchor_y"] = round(top + self.height(), 3)
         self.settings["position_format"] = POSITION_FORMAT
         save_settings(self.settings)
 
