@@ -32,13 +32,17 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSlider,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
     QToolTip,
 )
 
 import autostart_support
+import behavior_support
 import codex_monitor
+import library_channel
+import library_support
 import motion_support
 from process_support import InstanceGuard, atomic_json, log, remove_identity, write_identity
 
@@ -110,6 +114,8 @@ DEFAULT_SETTINGS = {
     "playback_fps": 60,
     "roaming_enabled": False,
     "roaming_speed": 30,
+    "auto_rest_enabled": True,
+    **{key: limits[2] for key, limits in behavior_support.RANGES.items()},
 }
 
 
@@ -127,13 +133,7 @@ def save_settings(data):
     atomic_json(SETTINGS_PATH, data)
 
 def list_pets():
-    pets = []
-    if not os.path.isdir(PETS_DIR):
-        return pets
-    for name in sorted(os.listdir(PETS_DIR)):
-        if os.path.isfile(os.path.join(PETS_DIR, name, "manifest.json")):
-            pets.append(name)
-    return pets
+    return library_support.discover_pets(PETS_DIR)[0]
 
 
 def resolve_active_pet(settings):
@@ -150,8 +150,7 @@ FRAMES_DIR = os.path.join(PETS_DIR, ACTIVE_PET, "frames") if ACTIVE_PET else ""
 MANIFEST_PATH = os.path.join(PETS_DIR, ACTIVE_PET, "manifest.json") if ACTIVE_PET else ""
 MANIFEST = {"fps": 60, "size": 1000, "states": {}}
 if ACTIVE_PET:
-    with open(MANIFEST_PATH, encoding="utf-8") as f:
-        MANIFEST = json.load(f)
+    MANIFEST = library_support.validate_pet(os.path.join(PETS_DIR, ACTIVE_PET))
 
 FPS = int(MANIFEST["fps"])
 
@@ -160,11 +159,12 @@ def switch_pet(name):
     global ACTIVE_PET, FRAMES_DIR, MANIFEST_PATH, MANIFEST, FPS
     if name not in list_pets():
         return False
+    candidate_path = os.path.join(PETS_DIR, name)
+    candidate = library_support.validate_pet(candidate_path)
     ACTIVE_PET = name
     FRAMES_DIR = os.path.join(PETS_DIR, name, "frames")
     MANIFEST_PATH = os.path.join(PETS_DIR, name, "manifest.json")
-    with open(MANIFEST_PATH, encoding="utf-8") as f:
-        MANIFEST = json.load(f)
+    MANIFEST = candidate
     FPS = int(MANIFEST["fps"])
     return True
 
@@ -274,9 +274,29 @@ class SettingsDialog(QDialog):
         self.roam_speed.setRange(10, 100)
         self.roam_speed.setValue(int(settings.get("roaming_speed", 30)))
         self.roam_speed.setToolTip("漫游速度：每秒 10–100 个逻辑像素")
+        options = behavior_support.normalize_settings(settings)
+        self.behavior_sliders = {}
+        behavior_page = QWidget()
+        behavior_form = QFormLayout(behavior_page)
+        behavior_form.addRow(self.roam_check)
+        self.auto_rest_check = QCheckBox("无操作后自动坐下 / 睡眠（保留原休息策略）")
+        self.auto_rest_check.setChecked(bool(settings.get("auto_rest_enabled", True)))
+        behavior_form.addRow(self.auto_rest_check)
+        behavior_form.addRow("散步速度", self.slider_row(self.roam_speed, " px/s"))
+        for key, label, suffix in (
+            ("roaming_activity", "活动频率", "%"),
+            ("roaming_walk_chance", "散步比例", "%"),
+            ("roaming_distance", "最远散步距离", " px"),
+            ("roaming_pause_min", "最短休息", " 秒"),
+            ("roaming_pause_max", "最长休息", " 秒"),
+        ):
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(*behavior_support.RANGES[key][:2])
+            slider.setValue(options[key])
+            self.behavior_sliders[key] = slider
+            behavior_form.addRow(label, self.slider_row(slider, suffix))
+        behavior_form.addRow(QLabel("散步比例为 0% 时只做原地动作。\n活动频率改变休息间隔，不改变动画倍速。\n最短休息高于最长时，最长自动调整。"))
         form.addRow("播放帧率上限", self.fps_combo)
-        form.addRow("", self.roam_check)
-        form.addRow("漫游速度", self.roam_speed)
         form.addRow("动作倍速", self.speed_combo)
         form.addRow("字幕长度", self.subtitle_combo)
         form.addRow("字幕大小", size_row)
@@ -284,12 +304,29 @@ class SettingsDialog(QDialog):
         form.addRow("", self.mini_check)
         form.addRow("", self.fullscreen_check)
         form.addRow("", self.autostart_check)
-        layout.addLayout(form)
+        appearance_page = QWidget()
+        appearance_page.setLayout(form)
+        tabs = QTabWidget()
+        tabs.addTab(behavior_page, "动作与移动")
+        tabs.addTab(appearance_page, "外观与启动")
+        layout.addWidget(tabs)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    @staticmethod
+    def slider_row(slider, suffix):
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        value = QLabel(f"{slider.value()}{suffix}")
+        value.setMinimumWidth(65)
+        slider.valueChanged.connect(lambda current: value.setText(f"{current}{suffix}"))
+        layout.addWidget(slider, 1)
+        layout.addWidget(value)
+        return row
 
     @staticmethod
     def _index_for_value(value):
@@ -305,10 +342,12 @@ class SettingsDialog(QDialog):
 
     def values(self):
         return {
+            **behavior_support.normalize_settings({key: slider.value() for key, slider in self.behavior_sliders.items()}),
             "speed": self.speed_combo.currentData(),
             "playback_fps": self.fps_combo.currentData(),
             "roaming_enabled": self.roam_check.isChecked(),
             "roaming_speed": self.roam_speed.value(),
+            "auto_rest_enabled": self.auto_rest_check.isChecked(),
             "subtitle_length": self.subtitle_combo.currentData(),
             "subtitle_size": self.size_slider.value(),
             "bar_length": self.bar_slider.value(),
@@ -385,6 +424,13 @@ class PetWindow(QWidget):
         self.roaming_speed = max(10, min(100, int(self.settings.get("roaming_speed", 30))))
         self.roam_direction = (0, 0)
         self.roam_until = 0
+        self.roam_remaining = None
+        self.roam_actual_speed = None
+        self.auto_action_end = None
+        self.one_shot_return = None
+        self.library_lease = None
+        self.library_paused = False
+        self.frozen_layer = None
         self.next_roam_at = time.monotonic() + random.uniform(3, 6)
         self._world_target = None
         self._world_widget = None
@@ -439,6 +485,11 @@ class PetWindow(QWidget):
         self.fullscreen_timer.setInterval(2000)
         self.fullscreen_timer.timeout.connect(self.check_fullscreen)
         self.fullscreen_timer.start()
+
+        self.library_timer = QTimer(self)
+        self.library_timer.setInterval(250)
+        self.library_timer.timeout.connect(self.poll_library)
+        self.library_timer.start()
 
         self.set_state("idle")
         self.restore_position(pet_state)
@@ -659,11 +710,17 @@ class PetWindow(QWidget):
         self.last_activity = time.monotonic()
         self.auto_sit_after = random.uniform(40, 60)
         self.manual_state = False
-        self.next_roam_at = self.last_activity + random.uniform(3, 6)
+        self.auto_action_end = None
+        self.one_shot_return = None
+        self.next_roam_at = self.last_activity + behavior_support.pause_seconds(self.settings)
 
     def set_state(self, name, hold=False, manual=False):
         if name not in MANIFEST["states"]:
             return
+        self.auto_action_end = None
+        if manual:
+            self.one_shot_return = None
+            self.auto_action_end = None
         now = time.monotonic()
         self.transition_image = None
         if (self.roaming_enabled and not manual and not self.manual_state
@@ -717,11 +774,13 @@ class PetWindow(QWidget):
         if self.roam_direction != (0, 0):
             self.set_state("idle")
         self.roam_direction = (0, 0)
+        self.roam_remaining = None
+        self.roam_actual_speed = None
         self.motion_timer.stop()
-        self.next_roam_at = time.monotonic() + random.uniform(2, 5)
+        self.next_roam_at = time.monotonic() + behavior_support.pause_seconds(self.settings)
 
     def step_roaming(self, now, delta):
-        if not self.roaming_enabled or self.drag or self.menu_open or self.press_global is not None or self.manual_state or not self.isVisible():
+        if not self.roaming_enabled or self.library_paused or self.drag or self.menu_open or self.press_global is not None or self.manual_state or not self.isVisible():
             self.motion_timer.stop()
             return
         if self.state not in ("idle", "move"):
@@ -730,9 +789,15 @@ class PetWindow(QWidget):
         if self.roam_direction == (0, 0):
             if now < self.next_roam_at:
                 return
-            angle = random.uniform(0, math.tau)
-            self.roam_direction = (math.cos(angle), math.sin(angle) * 0.35)
-            self.roam_until = now + random.uniform(3, 6)
+            action = behavior_support.choose_action(self.settings, MANIFEST["states"])
+            if action != "move":
+                self.next_roam_at = now + behavior_support.pause_seconds(self.settings)
+                if action != "idle":
+                    self.set_state(action, hold=True)
+                    self.auto_action_end = now + self.duration_ms() * random.randint(1, 3) / (1000 * self.speed)
+                return
+            self.roam_direction, self.roam_remaining, self.roam_actual_speed = behavior_support.walk_plan(self.settings, self.roaming_speed)
+            self.roam_until = now + self.roam_remaining / self.roam_actual_speed
             self.set_state("move")
         if now >= self.roam_until:
             self.stop_roaming()
@@ -744,9 +809,19 @@ class PetWindow(QWidget):
             return
         old_position = self.content_origin()
         dx, dy = self.roam_direction
-        moved = self.move_precisely(old_position[0] + dx * self.roaming_speed * delta,
-                                    old_position[1] + dy * self.roaming_speed * delta,
-                                    immediate=True)
+        distance = (self.roam_actual_speed or self.roaming_speed) * delta
+        if self.roam_remaining is not None:
+            distance = min(distance, self.roam_remaining)
+        requested = (old_position[0] + dx * distance, old_position[1] + dy * distance)
+        moved = self.move_precisely(*requested, immediate=True)
+        if math.hypot(moved[0] - requested[0], moved[1] - requested[1]) > 1e-6:
+            self.stop_roaming()
+            return
+        if self.roam_remaining is not None:
+            self.roam_remaining -= math.hypot(moved[0] - old_position[0], moved[1] - old_position[1])
+            if self.roam_remaining <= 1e-6:
+                self.stop_roaming()
+                return
         if (dx or dy) and moved == old_position:
             self.stop_roaming()
 
@@ -782,10 +857,12 @@ class PetWindow(QWidget):
         return image
 
     def next_frame(self):
+        if self.library_paused:
+            return
         now = time.monotonic()
         delta = min(0.1, max(0, now - self.last_tick))
         self.last_tick = now
-        if not self.drag and not self.menu_open and self.press_global is None and not self.manual_state:
+        if self.settings.get("auto_rest_enabled", True) and not self.drag and not self.menu_open and self.press_global is None and not self.manual_state:
             age = now - self.last_activity
             if age >= 90 and self.state != "sleep":
                 self.set_state("sleep", hold=True)
@@ -797,6 +874,17 @@ class PetWindow(QWidget):
         info = self.state_info(self.state)
         elapsed = max(0, (now - self.anim_started_at) * 1000 * self.speed)
         times, duration = self.playback_timing()
+        if self.one_shot_return is not None and elapsed >= duration:
+            previous = self.one_shot_return
+            self.one_shot_return = None
+            self.set_state(*previous)
+            self.next_roam_at = now + behavior_support.pause_seconds(self.settings)
+            return
+        if self.auto_action_end is not None and now >= self.auto_action_end:
+            self.auto_action_end = None
+            self.set_state("idle")
+            self.next_roam_at = now + behavior_support.pause_seconds(self.settings)
+            return
         if self.state in ("interact", "sit") and not self.hold_state and elapsed >= duration:
             self.set_state("idle")
             return
@@ -908,8 +996,19 @@ class PetWindow(QWidget):
         self._layer_cache_key = key if self.transition_image is None else None
         return layer
 
+    def rendered_layer(self):
+        composed = self.frozen_layer if self.library_paused else self.compose_layer()
+        translating = (not self.library_paused and self.roaming_enabled
+                       and self.state == "move" and self.roam_direction != (0, 0)
+                       and self.motion_timer.isActive() and not self.manual_state
+                       and not self.menu_open and self.press_global is None)
+        return motion_support.shift_layer(
+            composed, self.content_offset(), self.devicePixelRatioF(),
+            interpolate=translating,
+        )
+
     def paintEvent(self, event):
-        layer = motion_support.shift_layer(self.compose_layer(), self.content_offset(), self.devicePixelRatioF())
+        layer = self.rendered_layer()
         painter = QPainter(self)
         painter.drawImage(0, 0, layer)
         painter.end()
@@ -1016,6 +1115,9 @@ class PetWindow(QWidget):
             )
         )
         menu.addSeparator()
+        self.add_animation_actions(menu)
+        menu.addAction("刷新桌宠库", lambda: self.refresh_library(notify=True))
+        menu.addSeparator()
         roam_action = QAction("自动漫游", self, checkable=True)
         roam_action.setChecked(self.roaming_enabled)
         roam_action.triggered.connect(self.toggle_roaming)
@@ -1078,6 +1180,22 @@ class PetWindow(QWidget):
         self.save_pet_state()
         self.update()
 
+    def play_action(self, name):
+        if name not in MANIFEST["states"] or self.library_paused:
+            return
+        previous = (self.state, self.hold_state, self.manual_state) if self.manual_state else ("idle", False, False)
+        self.stop_roaming()
+        self.note_activity()
+        self.set_state(name, hold=True, manual=True)
+        self.one_shot_return = previous
+
+    def add_animation_actions(self, menu):
+        actions = menu.addMenu("全部动作（播放一次）")
+        for name in MANIFEST["states"]:
+            label = library_support.STATE_LABELS.get(name, name)
+            actions.addAction(label, lambda checked=False, state=name: self.play_action(state))
+        return actions
+
     def select_pet(self, name):
         if name == self.pet_name or not switch_pet(name):
             return
@@ -1112,6 +1230,76 @@ class PetWindow(QWidget):
         self.save_pet_state()
         self.refresh_status()
         self.update()
+
+    def reload_active_pet(self):
+        if not switch_pet(self.pet_name):
+            raise ValueError("Current pet is absent or invalid; keeping the existing image")
+        previous = (self.state, self.hold_state, self.manual_state)
+        self.stop_roaming()
+        self.cache.clear()
+        self.cache_bytes = 0
+        self._layer_cache_key = None
+        self.roam_idle_timing = None
+        self.transition_image = None
+        self.one_shot_return = None
+        self.auto_action_end = None
+        name, hold, manual = previous
+        self.set_state(name if name in MANIFEST["states"] else "idle", hold, manual)
+        self.last_tick = time.monotonic()
+        self.update()
+
+    def refresh_library(self, notify=False):
+        names, errors = library_support.discover_pets(PETS_DIR)
+        if self.pet_name in names:
+            self.reload_active_pet()
+        if notify:
+            detail = f"有效桌宠：{len(names)} 只。新角色已可在桌宠库中选择。"
+            if errors:
+                detail += "\n已忽略无效桌宠：\n" + "\n".join(f"{name}: {error}" for name, error in errors.items())
+            QMessageBox.information(self, "桌宠库刷新", detail)
+        return names
+
+    def library_request(self, data):
+        name = library_support.pet_name(data.get("name"))
+        transaction = data.get("transaction", "")
+        if len(transaction) != 32 or any(c not in "0123456789abcdef" for c in transaction):
+            raise ValueError("Invalid library transaction")
+        kind = data.get("kind")
+        if kind == "prepare":
+            if self.library_lease and self.library_lease[:2] == (transaction, name):
+                return {"pid": os.getpid(), "lease_seconds": max(0, self.library_lease[2] - time.monotonic())}
+            if self.library_lease or self.menu_open or self.drag or self.press_global is not None:
+                raise RuntimeError("Desktop pet is busy; close its menu or finish dragging and retry")
+            self.library_lease = (transaction, name, time.monotonic() + 30)
+            if name == self.pet_name:
+                self.stop_roaming()
+                self.frozen_layer = self.compose_layer().copy()
+                self.library_paused = True
+            return {"pid": os.getpid(), "lease_seconds": 30}
+        if not self.library_lease or self.library_lease[:2] != (transaction, name):
+            raise RuntimeError("No matching library lease")
+        if kind not in ("finish", "cancel"):
+            raise ValueError("Unknown library command")
+        if kind == "finish" and name == self.pet_name:
+            self.reload_active_pet()
+        self.library_lease = None
+        self.library_paused = False
+        self.frozen_layer = None
+        self.last_tick = self.last_motion_tick = time.monotonic()
+        self.update()
+        return {"pid": os.getpid(), "pets": list_pets()}
+
+    def poll_library(self):
+        if self.library_lease and time.monotonic() >= self.library_lease[2]:
+            try:
+                if self.library_paused:
+                    self.reload_active_pet()
+                self.library_paused = False
+                self.frozen_layer = None
+            except (OSError, ValueError, TypeError) as error:
+                log("pet_runtime", f"library lease expired; frozen image retained: {error}")
+            self.library_lease = None
+        library_channel.receive(os.path.dirname(SETTINGS_PATH), self.library_request)
 
     def save_pet_state(self):
         disk = load_settings()

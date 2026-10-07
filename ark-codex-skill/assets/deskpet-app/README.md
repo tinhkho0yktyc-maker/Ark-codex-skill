@@ -22,8 +22,13 @@
 - 无操作约 40–60 秒自动坐下，90 秒自动睡觉；新任务可唤醒自动休息，手动状态优先。
 - 右键“自动漫游”控制随机短距离行走；行走与待机有约 140ms 转场，停下保留朝向，自动漫游待机把原片长停帧限为 120ms。互动、拖动、菜单和休息时暂停；非漫游及手动动作保持原时序。
 - 设置可调整漫游速度、动作倍速、播放上限、字幕长度、字号与宽度。
+- 设置 →“动作与移动”可调整活动频率、散步比例、最远距离和休息上下限；原地动作随机播放 1–3 个完整周期，原来的自动休息也可单独关闭。
+- “全部动作（播放一次）”可预览各动作后恢复原状态；Move 预览不移动位置。仅有真实 Special 的角色才显示特殊动作。
+- “刷新桌宠库”重新发现有效角色、隔离无效清单，并刷新当前角色缓存。
 
 漫游使用亚像素坐标与物理像素/DPI 补偿，角色和字幕整体插值移动。移动刷新参考屏幕刷新率，动作播放仍保留原 20/30/60fps 上限；缓存透明图层避免每次位移重绘字体。它不保证严格垂直同步，也不能消除源动画本身的步行动作起伏。
+
+实际移动时使用插值防抖，停下后仅对显示偏移做物理像素对齐，避免放松动作和字幕持续被平滑。保存位置与连续运动坐标不会因此取整；单独预览 Move 动画也走清晰的静止绘制路径。
 - 字幕宽度不随角色缩放变化；悬停查看完整任务、模型、进度和 Token。
 - 每个角色分别保存位置、大小与倍速；显示器或 DPI 变化后限制在工作区。
 
@@ -33,11 +38,14 @@
 
 ```text
 python <Skill目录>/scripts/setup_env.py <项目目录> --tools
-<项目目录>/.tools-venv/Scripts/python.exe <Skill目录>/scripts/process_webm.py --src <WebM目录> --name <角色名> --out <项目目录>/pets/<角色名>
-<项目目录>/.tools-venv/Scripts/python.exe <Skill目录>/scripts/validate_deskpet.py <项目目录>/pets/<角色名> --allow-inactive --out <项目目录>/work/预览.png
+<项目目录>/.tools-venv/Scripts/python.exe <Skill目录>/scripts/process_webm.py --src <WebM目录> --name <角色名> --out <项目目录>/work/prepared/<角色名>
+<项目目录>/.tools-venv/Scripts/python.exe <Skill目录>/scripts/validate_deskpet.py <项目目录>/work/prepared/<角色名> --allow-inactive --out <项目目录>/work/预览.png
+<项目目录>/.tools-venv/Scripts/python.exe <Skill目录>/scripts/install_deskpet.py <项目目录>/work/prepared/<角色名> --project <项目目录> --name <角色名>
 ```
 
-路径有空格时用双引号包围。一个输入目录只放一个角色/皮肤的 Relax、Interact、Move、Sit、Sleep 动画。Default 经常是坏文件，不映射为第六种模式。转换拒绝覆盖旧角色；重做时先输出到新目录，保留旧素材并检查预览后再替换。
+路径有空格时用双引号包围。一个输入目录只放一个角色/皮肤的 Relax、Interact、Move、Sit、Sleep，以及真实可用的 Special 动画。Default 经常是坏文件，不映射为第六种模式。转换拒绝覆盖旧角色；同名安装须显式 `--replace`，旧版本保留在 `pets/.backups/`。
+
+安装器检查所有 PNG、时序和裁剪偏移，只复制清单与帧。运行中的新版本会先冻结当前角色、完成替换后刷新缓存，不必重启；旧程序首次更新仍需重启。菜单或拖动时拒绝导入请求。回执不确定且无法确认再次冻结时，不盲目回滚运行中的素材，而保留新版本与旧备份并报告。设置和源 WebM 不会被覆盖。
 
 v2 素材保留源帧时间戳与透明画布偏移，仍兼容旧固定帧率素材。默认 60fps 是播放刷新上限，不能给原来 20fps 的示例补帧；动作倍速也不是帧率。遇到黑底优先使用仓库的 VP9 透明导出脚本重新导出；网页默认 AV1 文件即使标记 alpha，也可能没有真实透明数据。`--recover-black` 只是可选近似修复，可能误删深色细节，需要人工检查。
 

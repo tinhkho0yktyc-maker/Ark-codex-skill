@@ -48,15 +48,29 @@ def quantized_origin(position, screen_origin, ratio):
                  for value, origin in zip(position, screen_origin))
 
 
-def shift_layer(image, offset, ratio):
+def presentation_offset(offset, ratio, interpolate=True):
+    """Align stationary raster pixels without rounding the world-space anchor."""
+    if not math.isfinite(ratio) or ratio <= 0:
+        raise ValueError("Device pixel ratio must be finite and positive")
+    if interpolate:
+        return tuple(offset)
+    def nearest(value):
+        return math.floor(value + 0.5) if value >= 0 else math.ceil(value - 0.5)
+    return tuple(nearest(value * ratio) / ratio for value in offset)
+
+
+def shift_layer(image, offset, ratio, interpolate=True):
     """Separable bilinear filtering, including glyphs, on the physical pixel grid.
 
     Qt's 1:1 image blit rounds fractional translations. Source-mode opacity
     interpolates premultiplied RGBA instead; opaque overlaps remain opaque and
     dark artwork is not keyed or recolored. Transparent margins absorb clipping.
+    Stationary presentation uses integer physical displacement, not interpolation;
+    it must not soften captions or quantize saved/continuous movement coordinates.
     """
     if image.isNull():
         return image
+    offset = presentation_offset(offset, ratio, interpolate)
     result = image
     for horizontal, displacement in ((True, offset[0] * ratio), (False, offset[1] * ratio)):
         if abs(displacement) < 1e-7:
