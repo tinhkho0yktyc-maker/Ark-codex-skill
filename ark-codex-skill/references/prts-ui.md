@@ -15,6 +15,8 @@ The widget uses Naive UI. The three relevant selects are `.n-select` elements:
 2. `模型组` (model group): options are `战斗` and `基建`.
 3. `动画` (animation): options include `Default`, `Interact`, `Move`, `Relax`, `Sit`, `Sleep`.
 
+Some models also advertise `Special`. The exporter probes it after the base actions; if absent it closes the dropdown and continues, but a present action's download failure is reported. Do not assume every operator has Special.
+
 To change a select:
 
 1. Click the `.n-select` element.
@@ -27,7 +29,7 @@ To change a select:
 - Click it and wait for the browser download event.
 - The exported file is a WebM animation. Suggested filenames look like
   `浊心斯卡蒂-默认-基建-Interact-x1.webm`.
-- The `Default` animation often exports a broken 110-byte file; skip files under 1000 bytes when processing.
+- Default is often a broken 110-byte file. A broken supplied Special file must be reported, not silently ignored.
 
 ## Search API
 
