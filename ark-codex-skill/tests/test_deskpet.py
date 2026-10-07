@@ -306,7 +306,64 @@ def alpha_centroid(image):
     return horizontal / mass, vertical / mass
 
 
+def edge_energy(image):
+    """Measure raster edge strength, not dimensions or subjective resolution."""
+    data = bytes(image.constBits())
+    stride = image.bytesPerLine()
+    total = 0
+    for y in range(2, image.height() - 2):
+        for x in range(2, image.width() - 2):
+            index = y * stride + x * 4
+            value = data[index + 2]
+            total += (value - data[index + 6]) ** 2 + (value - data[index + stride + 2]) ** 2
+    return total
+
+
 class SubpixelTests(unittest.TestCase):
+    def test_stationary_offsets_align_to_physical_pixels_for_all_dpi(self):
+        for ratio in (1, 1.25, 1.5, 1.75, 2):
+            for offset in ((0.25, 0.35), (-0.3, 0.4), (0.6, -0.25), (-0.5 / ratio, 0.5 / ratio)):
+                aligned = pet.motion_support.presentation_offset(offset, ratio, interpolate=False)
+                self.assertEqual(pet.motion_support.presentation_offset(offset, ratio), offset)
+                for before, after in zip(offset, aligned):
+                    self.assertAlmostEqual(after * ratio, round(after * ratio), places=9)
+                    self.assertLessEqual(abs((before - after) * ratio), 0.5 + 1e-9)
+
+    def test_stationary_layer_retains_pixels_and_black_alpha(self):
+        source = QImage(64, 64, QImage.Format_ARGB32_Premultiplied)
+        source.fill(Qt.transparent)
+        painter = QPainter(source)
+        painter.fillRect(12, 8, 28, 10, QColor(40, 150, 70, 190))
+        painter.fillRect(22, 34, 18, 18, QColor(0, 0, 0, 255))
+        painter.end()
+        baseline = bytes(source.constBits())
+        for ratio in (1, 1.25, 1.5, 1.75, 2):
+            source.setDevicePixelRatio(ratio)
+            aligned = pet.motion_support.shift_layer(source, (0.4995 / ratio, -0.4995 / ratio), ratio, interpolate=False)
+            self.assertIs(aligned, source)
+            self.assertEqual(bytes(aligned.constBits()), baseline)
+            self.assertEqual(aligned.pixelColor(29, 42).getRgb(), (0, 0, 0, 255))
+            blurred = pet.motion_support.shift_layer(source, (0, 0.4995 / ratio), ratio)
+            self.assertLess(edge_energy(blurred), edge_energy(source))
+
+    def test_stationary_integer_shift_does_not_resample_or_clip_the_subject(self):
+        source = QImage(64, 64, QImage.Format_ARGB32_Premultiplied)
+        source.fill(Qt.transparent)
+        painter = QPainter(source)
+        painter.fillRect(12, 8, 28, 10, QColor(40, 150, 70, 190))
+        painter.fillRect(22, 34, 18, 18, QColor(0, 0, 0, 255))
+        painter.end()
+        before = alpha_centroid(source)
+        for ratio in (1, 1.25, 1.5, 1.75, 2):
+            source.setDevicePixelRatio(ratio)
+            shifted = pet.motion_support.shift_layer(source, (-0.75 / ratio, 0.65 / ratio), ratio, interpolate=False)
+            after = alpha_centroid(shifted)
+            self.assertAlmostEqual(after[0] - before[0], -1)
+            self.assertAlmostEqual(after[1] - before[1], 1)
+            self.assertEqual(edge_energy(shifted), edge_energy(source))
+            self.assertEqual(shifted.size(), source.size())
+            self.assertEqual(shifted.devicePixelRatioF(), ratio)
+
     def test_physical_origin_maps_fractional_and_negative_screens(self):
         mapping = pet.motion_support.map_native_origin
         self.assertEqual(mapping((302, 450), (0, 0), (0, 0), 1.5), (302 / 1.5, 300))
@@ -407,7 +464,7 @@ class WindowTests(unittest.TestCase):
         for change in self.patches:
             change.start()
         self.window = pet.PetWindow()
-        for timer in (self.window.timer, self.window.status_timer, self.window.fullscreen_timer, self.window.motion_timer):
+        for timer in (self.window.timer, self.window.status_timer, self.window.fullscreen_timer, self.window.motion_timer, self.window.library_timer):
             timer.stop()
 
     def tearDown(self):
@@ -733,6 +790,66 @@ class WindowTests(unittest.TestCase):
             self.assertAlmostEqual(after[0] - before[0], 0.25 * 1.5, delta=0.025)
             self.assertAlmostEqual(after[1] - before[1], 0.35 * 1.5, delta=0.025)
 
+    def test_idle_caption_and_body_are_crisp_at_fractional_rest(self):
+        w = self.window
+        with patch.object(w, "devicePixelRatioF", lambda: 1.5), \
+             patch.object(w, "native_origin", lambda screen=None: pet.motion_support.quantized_origin((w.x(), w.y()), (0, 0), 1.5)):
+            w.move_precisely(250 + 0.4995 / 1.5, 250 + 0.4995 / 1.5)
+            origin = w.content_origin()
+            baseline = w.compose_layer()
+            rendered = w.rendered_layer()
+            self.assertEqual(bytes(rendered.constBits()), bytes(baseline.constBits()))
+            old = pet.motion_support.shift_layer(baseline, w.content_offset(), 1.5)
+            self.assertLess(edge_energy(old), edge_energy(rendered))
+            self.assertEqual(w.content_origin(), origin)
+
+    def test_moving_layer_stays_filtered_and_stop_restores_sharp_edges(self):
+        w = self.window
+        with patch.object(w, "devicePixelRatioF", lambda: 1.5), \
+             patch.object(w, "native_origin", lambda screen=None: pet.motion_support.quantized_origin((w.x(), w.y()), (0, 0), 1.5)):
+            w.roaming_enabled = True
+            w.roam_direction = (1, 0)
+            w.set_state("move")
+            w.transition_image = None
+            w.motion_timer.start(6)
+            w.move_precisely(250 + 0.4995 / 1.5, 250 + 0.4995 / 1.5)
+            source = w.compose_layer()
+            continuous = pet.motion_support.shift_layer(source, w.content_offset(), 1.5)
+            moving = w.rendered_layer()
+            self.assertEqual(bytes(moving.constBits()), bytes(continuous.constBits()))
+            self.assertLess(edge_energy(continuous), edge_energy(source))
+            w.stop_roaming()
+            w.transition_image = None
+            source = w.compose_layer()
+            stopped = w.rendered_layer()
+            self.assertEqual(edge_energy(stopped), edge_energy(source))
+            self.assertFalse(w.motion_timer.isActive())
+
+    def test_all_stationary_actions_use_pixel_aligned_presentation_at_each_dpi(self):
+        w = self.window
+        for ratio in (1, 1.25, 1.5, 1.75, 2):
+            with patch.object(w, "devicePixelRatioF", lambda: ratio), \
+                 patch.object(w, "native_origin", lambda screen=None: pet.motion_support.quantized_origin((w.x(), w.y()), (-1920, -100), ratio)):
+                for state in ("idle", "interact", "move", "sit", "sleep"):
+                    w.set_state(state, hold=True, manual=True)
+                    w.move_precisely(250 + 0.35 / ratio, 250 + 0.35 / ratio)
+                    origin = w.content_origin()
+                    source = w.compose_layer()
+                    expected = pet.motion_support.shift_layer(source, w.content_offset(), ratio, interpolate=False)
+                    actual = w.rendered_layer()
+                    self.assertEqual(bytes(actual.constBits()), bytes(expected.constBits()))
+                    self.assertEqual(edge_energy(actual), edge_energy(source))
+                    self.assertEqual(actual.size(), source.size())
+                    self.assertEqual(w.content_origin(), origin)
+
+    def test_stationary_move_preview_is_not_treated_as_actual_motion(self):
+        w = self.window
+        w.play_action("move")
+        with patch.object(pet.motion_support, "shift_layer", wraps=pet.motion_support.shift_layer) as shift:
+            w.rendered_layer()
+        self.assertFalse(shift.call_args.kwargs["interpolate"])
+        self.assertEqual(w.state, "move")
+
     def test_fractional_anchor_survives_action_switch_and_settings_save(self):
         w = self.window
         w.move_precisely(250.2, 250.4)
@@ -761,6 +878,128 @@ class WindowTests(unittest.TestCase):
         w.refresh_status()
         self.app.processEvents()
         self.assertTrue(w.grab().save(str(Path(self.temp.name) / "preview.png")))
+
+    def test_behavior_settings_clamp_and_preserve_old_speed(self):
+        dialog = pet.SettingsDialog(dict(self.window.settings, roaming_speed=32,
+                                        roaming_pause_min=20, roaming_pause_max=3))
+        values = dialog.values()
+        self.assertEqual(values["roaming_speed"], 32)
+        self.assertEqual((values["roaming_pause_min"], values["roaming_pause_max"]), (20, 20))
+        self.assertTrue(values["auto_rest_enabled"])
+        dialog.close()
+
+    def test_all_actions_menu_only_contains_real_states(self):
+        from PySide6.QtWidgets import QMenu
+        menu = self.window.add_animation_actions(QMenu(self.window))
+        self.assertEqual(len(menu.actions()), 5)
+        self.assertFalse(any("Special" in a.text() for a in menu.actions()))
+        with patch.dict(pet.MANIFEST["states"], special=dict(pet.MANIFEST["states"]["interact"])):
+            menu = self.window.add_animation_actions(QMenu(self.window))
+            self.assertTrue(any("Special" in a.text() for a in menu.actions()))
+
+    def test_one_shot_move_is_stationary_and_returns_to_manual_sleep(self):
+        w = self.window
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.set_state("sleep", hold=True, manual=True)
+            w.play_action("move")
+        origin = w.content_origin()
+        with patch.object(pet.time, "monotonic", lambda: 100.05):
+            w.next_frame()
+        self.assertEqual(w.content_origin(), origin)
+        self.assertEqual(w.state, "move")
+        with patch.object(pet.time, "monotonic", lambda: 110):
+            w.next_frame()
+        self.assertEqual(w.state, "sleep")
+        self.assertTrue(w.manual_state)
+
+    def test_optional_special_finishes_once_using_native_timing(self):
+        w = self.window
+        temporary_frames = Path(self.temp.name) / "frames"
+        shutil.copytree(Path(pet.FRAMES_DIR) / "interact", temporary_frames / "special")
+        with patch.dict(pet.MANIFEST["states"], special=dict(pet.MANIFEST["states"]["interact"])), \
+                patch.object(pet, "FRAMES_DIR", str(temporary_frames)):
+            with patch.object(pet.time, "monotonic", lambda: 100):
+                w.play_action("special")
+                self.assertFalse(w.current_image().isNull())
+            duration = w.duration_ms() / 1000 / w.speed
+            with patch.object(pet.time, "monotonic", lambda: 100 + duration - 0.001):
+                w.next_frame()
+                self.assertEqual(w.state, "special")
+            with patch.object(pet.time, "monotonic", lambda: 100 + duration + 0.001):
+                w.next_frame()
+                self.assertEqual(w.state, "idle")
+                self.assertFalse(w.manual_state)
+
+    def test_walk_distance_stops_without_overshoot(self):
+        w = self.window
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.note_activity()
+            w.roaming_enabled = True
+            w.roam_direction = (1, 0)
+            w.set_state("move")
+            w.roam_until = 200
+            w.roam_remaining = 0.25
+            w.roam_actual_speed = 100
+            before = w.content_origin()
+            w.step_roaming(100.01, 0.1)
+        self.assertAlmostEqual(w.content_origin()[0] - before[0], 0.25)
+        self.assertEqual(w.state, "idle")
+
+    def test_diagonal_walk_stops_at_one_screen_boundary_not_slides_along_it(self):
+        w = self.window
+        screen = FakeScreen(QRect(0, 0, 1920, 1080))
+        with patch.object(w, "layout_screen", lambda: screen), patch.object(pet.time, "monotonic", lambda: 100):
+            w.note_activity()
+            w.roaming_enabled = True
+            w.roam_direction = (1, 0.35)
+            w.set_state("move")
+            w.roam_until = 200
+            w.move_precisely(1920 - w.width() - 0.1, 200, screen)
+            w.step_roaming(100.1, 0.1)
+            self.assertEqual(w.roam_direction, (0, 0))
+            self.assertEqual(w.state, "idle")
+
+    def test_automatic_rest_can_be_disabled_without_changing_manual_states(self):
+        w = self.window
+        w.settings["auto_rest_enabled"] = False
+        w.roaming_enabled = False
+        w.last_activity = 0
+        with patch.object(pet.time, "monotonic", lambda: 1000):
+            w.next_frame()
+        self.assertEqual(w.state, "idle")
+
+    def test_library_prepare_freezes_and_finish_preserves_user_settings(self):
+        w = self.window
+        before = (w.scale, w.speed, w.show_status)
+        transaction = "a" * 32
+        w.library_request(dict(kind="prepare", name=w.pet_name, transaction=transaction))
+        self.assertTrue(w.library_paused)
+        self.assertIsNotNone(w.frozen_layer)
+        w.next_frame()
+        w.library_request(dict(kind="finish", name=w.pet_name, transaction=transaction))
+        self.assertFalse(w.library_paused)
+        self.assertEqual((w.scale, w.speed, w.show_status), before)
+
+    def test_library_rejects_busy_and_wrong_transaction(self):
+        w = self.window
+        data = dict(kind="prepare", name=w.pet_name, transaction="b" * 32)
+        w.menu_open = True
+        with self.assertRaises(RuntimeError):
+            w.library_request(data)
+        w.menu_open = False
+        w.library_request(data)
+        with self.assertRaises(RuntimeError):
+            w.library_request(dict(data, kind="finish", transaction="c" * 32))
+        w.library_request(dict(data, kind="cancel"))
+
+    def test_library_expired_lease_recovers_instead_of_remaining_frozen(self):
+        w = self.window
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.library_request(dict(kind="prepare", name=w.pet_name, transaction="d" * 32))
+        with patch.object(pet.time, "monotonic", lambda: 131):
+            w.poll_library()
+        self.assertFalse(w.library_paused)
+        self.assertIsNone(w.library_lease)
 
 
 if __name__ == "__main__":
