@@ -31,6 +31,9 @@ def scaffold(target, pet_name="予愿安洁莉娜"):
         "pet": pet_name or "予愿安洁莉娜", "pet_states": {},
         "autostart_with_codex": False, "playback_fps": 60,
         "roaming_enabled": False, "roaming_speed": 30,
+        "roaming_activity": 100, "roaming_walk_chance": 60,
+        "roaming_distance": 160, "roaming_pause_min": 2, "roaming_pause_max": 5,
+        "auto_rest_enabled": True,
     }
     (target / "settings.json").write_text(
         json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8",

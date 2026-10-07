@@ -23,6 +23,7 @@ STATE_MAP = (
     ("Relax", "idle"), ("Interact", "interact"), ("Move", "move"),
     ("Sit", "sit"), ("Sleep", "sleep"),
 )
+OPTIONAL_MAP = (("Special", "special"),)
 
 
 def find_sources(directory):
@@ -32,9 +33,11 @@ def find_sources(directory):
         if not path.is_file() or path.suffix.lower() != ".webm":
             continue
         if path.stat().st_size < 1000:
+            if re.search(r"(?<![a-z])Special(?![a-z])", path.stem, re.IGNORECASE):
+                raise ValueError(f"Optional Special WebM is broken: {path.name}")
             print("skip broken WebM:", path.name, flush=True)
             continue
-        for token, state in STATE_MAP:
+        for token, state in STATE_MAP + OPTIONAL_MAP:
             if re.search(rf"(?<![a-z]){token}(?![a-z])", path.stem, re.IGNORECASE):
                 if state in sources:
                     raise ValueError(

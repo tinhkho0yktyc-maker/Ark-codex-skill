@@ -6,11 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 from PIL import Image, ImageDraw
 
 
 STATES = ("idle", "interact", "move", "sit", "sleep")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "assets" / "deskpet-app"))
+from library_support import validate_pet
 
 
 def alpha_bbox(image: Image.Image):
@@ -52,20 +55,20 @@ def main():
     parser.add_argument("--allow-bbox-mismatch", action="store_true")
     args = parser.parse_args()
 
-    manifest = json.loads((args.pet_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest = validate_pet(args.pet_dir, check_frames=True)
     project = args.pet_dir.parent.parent
     settings_path = project / "settings.json"
     settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.is_file() else {"pet": args.pet_dir.name}
     if not args.allow_inactive:
         assert settings["pet"] == args.pet_dir.name, (settings["pet"], args.pet_dir.name)
-    assert set(manifest["states"]) == set(STATES), manifest["states"].keys()
+    states = list(STATES) + sorted(set(manifest["states"]) - set(STATES))
 
     cell_w, cell_h = 300, 380
-    sheet = checkerboard((cell_w * len(STATES), cell_h))
+    sheet = checkerboard((cell_w * len(states), cell_h))
     draw = ImageDraw.Draw(sheet)
     summary = {}
 
-    for column, state in enumerate(STATES):
+    for column, state in enumerate(states):
         info = manifest["states"][state]
         files = sorted((args.pet_dir / "frames" / state).glob("frame_*.png"))
         assert len(files) == info["count"], (state, len(files), info["count"])

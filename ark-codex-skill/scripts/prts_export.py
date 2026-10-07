@@ -12,6 +12,7 @@ except ImportError:
     sys.exit("playwright is required: run 'pip install playwright' first")
 
 ANIMATIONS = ["Default", "Interact", "Move", "Relax", "Sit", "Sleep"]
+OPTIONAL_ANIMATIONS = ["Special"]
 LOAD_BTN = "\u70b9\u6b64\u8f7d\u5165\u6a21\u578b"
 JIANJI = "\u57fa\u5efa"
 
@@ -49,14 +50,18 @@ def find_chrome():
     return None
 
 
-def select_option(page, select, text):
+def select_option(page, select, text, required=True):
     select.click()
     page.wait_for_timeout(500)
     option = page.locator(".n-base-select-option", has_text=text).first
     if option.count() == 0:
+        if not required:
+            page.keyboard.press("Escape")
+            return False
         raise RuntimeError(f"option not found: {text}")
     option.click()
     page.wait_for_timeout(1200)
+    return True
 
 
 def find_download_button(page):
@@ -130,9 +135,11 @@ def run_export(operator, skin, out_dir):
 
             skin_label = skin or "\u9ed8\u8ba4"
             encoder_warmed = False
-            for anim in ANIMATIONS:
+            for anim in ANIMATIONS + OPTIONAL_ANIMATIONS:
                 anim_select = page.locator(".n-select").nth(2)
-                select_option(page, anim_select, anim)
+                if not select_option(page, anim_select, anim, required=anim not in OPTIONAL_ANIMATIONS):
+                    print("OPTIONAL ANIMATION ABSENT:", anim, flush=True)
+                    continue
                 page.wait_for_timeout(2000)
                 download = find_download_button(page)
                 if anim != "Default" and not encoder_warmed:
