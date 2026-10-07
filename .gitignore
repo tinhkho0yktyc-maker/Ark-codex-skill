@@ -21,3 +21,9 @@ test-output/
 .env
 .env.*
 !.env.example
+.library-control/
+.import-*/
+.install-lock/
+.backups/
+.failed-*/
+release-output/

@@ -2,6 +2,8 @@
 
 用明日方舟干员的 PRTS 基建模型制作透明 Windows 桌宠，也可以让多个角色共享一套程序。本仓库发布的是可安装的 Codex Skill、桌宠源码模板和素材工具，不是打包好的 EXE 安装程序。
 
+当前源码候选版本为 **0.3.0-rc.1**。2026-10-06 的 `main` 源码更新包含可配置漫游、全部动作 / 可选 Special、安全角色安装与热刷新、源码打包工具，以及静止人物和字幕清晰度修复。本次同步不创建 GitHub Release 或 tag，旧本地 ZIP 不代表最新源码；请使用当前 `main` 的 **Code → Download ZIP**。参见 [更新记录](CHANGELOG.md) 和 [发布候选说明](docs/release.md)。
+
 ## 原项目与致谢
 
 **原项目地址：[AstrariaX/Ark-codex-skill](https://github.com/AstrariaX/Ark-codex-skill)**
@@ -22,11 +24,16 @@
 - 登录后监听 Codex/ChatGPT；支持计划任务与注册表备用入口，日志轮转和原子设置保存。
 - 日常运行环境与素材工具环境分离。
 - 新素材转换保留原 WebM 帧及时间戳，裁去透明外边缘，并记录原画布偏移；兼容上游固定帧率素材。
-- 附带 59 项隔离回归测试，使用临时生成的非游戏素材，不需要本机新增干员文件。
+- 附带 97 项隔离回归测试，使用临时生成的非游戏素材，不需要本机新增干员文件。
+- “动作与移动”设置支持活动频率、散步比例、最远距离和休息上下限，随机原地动作播放 1–3 个完整周期；原有自动休息可单独关闭。
+- 全部动作可播放一次，之后恢复原状态。真实存在的 Special 才显示，不用 Interact 冒充。
+- 安全安装器校验全部 PNG、清单、时间戳与偏移；支持运行中冻结 / 刷新，同名替换明确授权并保留备份。
 
 自动启动与自动漫游默认关闭，由用户在菜单中开启。
 
 漫游位置使用连续小数坐标，并根据本窗口的实际物理像素位置补偿 DPI 取整。角色和字幕先绘制为同一张缓存的透明图层，再以预乘 RGBA 插值整体平移，避免整窗和文字在 150% 缩放下跳格。位移计时器参考屏幕刷新率（60–180Hz 范围），动作仍受原有 20/30/60fps 上限控制，不补造动画帧；这不是严格的显示器垂直同步保证。
+
+插值只在实际自动移动期间启用。停下后，显示偏移对齐物理像素，避免放松动作和字幕持续变软；内部连续坐标和保存位置保持不变。单独预览 Move 动画不被视为移动。新增清晰度测试覆盖 100%、125%、150%、175%、200% 缩放。
 
 ## 环境要求
 
@@ -85,16 +92,17 @@ ffprobe -version
 
 已有系统 Chrome/Edge、不想额外下载 Chromium，可以在第一条命令末尾加 `--skip-browser`。
 
-把**同一个干员、同一款皮肤**的 WebM 放在 `my-deskpet/work/webm/<角色名>/`。文件名需包含动画名：`Relax`、`Interact`、`Move`、`Sit`、`Sleep`。PRTS 导出的 `Default` 常是 110 字节坏文件，不用于动作映射。
+把**同一个干员、同一款皮肤**的 WebM 放在 `my-deskpet/work/webm/<角色名>/`。文件名需包含动画名：`Relax`、`Interact`、`Move`、`Sit`、`Sleep`，还可包含可选 `Special`。PRTS 导出的 `Default` 常是 110 字节坏文件，不用于动作映射；Special 缺席正常，已提供但损坏会报错。
 
 例如：
 
 ```powershell
-.\my-deskpet\.tools-venv\Scripts\python.exe ark-codex-skill/scripts/process_webm.py --src "my-deskpet/work/webm/凯尔希·思衡托" --name "凯尔希·思衡托" --out "my-deskpet/pets/凯尔希·思衡托"
-.\my-deskpet\.tools-venv\Scripts\python.exe ark-codex-skill/scripts/validate_deskpet.py "my-deskpet/pets/凯尔希·思衡托" --allow-inactive --out "my-deskpet/work/凯尔希预览.png"
+.\my-deskpet\.tools-venv\Scripts\python.exe ark-codex-skill/scripts/process_webm.py --src "my-deskpet/work/webm/凯尔希·思衡托" --name "凯尔希·思衡托" --out "my-deskpet/work/prepared/凯尔希·思衡托"
+.\my-deskpet\.tools-venv\Scripts\python.exe ark-codex-skill/scripts/validate_deskpet.py "my-deskpet/work/prepared/凯尔希·思衡托" --allow-inactive --out "my-deskpet/work/凯尔希预览.png"
+.\my-deskpet\.tools-venv\Scripts\python.exe ark-codex-skill/scripts/install_deskpet.py "my-deskpet/work/prepared/凯尔希·思衡托" --project my-deskpet
 ```
 
-重新启动桌宠后，右键 **桌宠库** 选择新角色。转换过程中不改原 WebM，失败不留下半成品角色，也不会覆盖已存在的角色目录。重处理同名角色时，请先输出到新目录，确认预览后关闭桌宠、保留旧素材，再替换。
+安装完成后可直接右键 **桌宠库** 选择新角色，不必重启新版本程序；也可使用 **刷新桌宠库**。转换过程中不改原 WebM，失败不留下半成品角色，也不会覆盖已存在的角色目录。同名安装必须显式加 `--replace`，旧素材保留在 `pets/.backups/`；替换失败尝试恢复。若回执不确定且无法重新冻结运行程序，会保留新版本和旧备份并明确报告，不盲目操作播放中的素材。旧程序第一次升级仍需重启，见发布说明。
 
 若解码得到不透明黑底，工具会明确报错。优先重新导出带透明通道的素材；仅在确实需要近似去黑底时使用 `--recover-black`，并检查轮廓、阴影和预览。它不是无损透明恢复。
 
@@ -114,6 +122,8 @@ ffprobe -version
 - 右键解锁后可以拖动；松开恢复之前的状态。
 - 右键选择坐下、放松、睡觉，手动状态不会被自动休息覆盖。
 - 右键 **自动漫游** 开关移动；设置中调整速度、动作倍速与 20/30/60fps 播放上限。
+- 设置 → **动作与移动** 调整散步比例、最远距离、休息上下限、活动频率。0% 散步只做原地动作；活动频率不改变动画倍速。
+- 右键 **全部动作（播放一次）** 可预览全部可用动作，Move 预览不改变位置；播放完恢复原状态。只有角色确实提供 Special 才显示特殊动作。
 - **随 Codex 启动** 或托盘 **开机自启动** 是可选项，开启后注册当前用户登录任务与备用启动项；检测到 Codex/ChatGPT 才显示桌宠和托盘。
 - 托盘 **隐藏桌宠** 关闭小人，本次宿主运行期间不会立即重拉；**显示桌宠** 可恢复。
 - 托盘 **退出** 停止整套监听。之后可双击“启动托盘”快捷方式，或运行项目内 `codex_pet_launcher.pyw` 恢复。
@@ -140,9 +150,10 @@ python ark-codex-skill/scripts/create_shortcuts.py --project my-deskpet
 ```powershell
 .\my-deskpet\.venv\Scripts\python.exe ark-codex-skill/tests/test_deskpet.py
 .\my-deskpet\.tools-venv\Scripts\python.exe ark-codex-skill/tests/test_pipeline.py
+.\my-deskpet\.tools-venv\Scripts\python.exe ark-codex-skill/tests/test_extensions.py
 ```
 
-第一组 48 项测试覆盖日志解析、进程身份、恢复、窗口行为、漫游转场、亚像素与 150% DPI 补偿、图层缓存和双计时器；第二组 11 项测试覆盖脚手架、透明转换和失败清理，包括真实 FFmpeg 合成 WebM 往返，以及浏览器 VP9 导出保留纯黑细节的往返测试。浏览器测试需要本机 Chrome/Edge，否则跳过。测试不会修改已运行桌宠的设置、启动项或 Codex 会话。实际关机重启、不同显示器组合与更多 PRTS 角色仍需在对应环境验证。
+三组测试分别覆盖运行行为、素材往返及扩展 / 导入 / 发布。保留原有日志、身份、防抖与透明回归，并新增完整动作、漫游范围、冻结租约、替换恢复、回执不确定和发布白名单校验。浏览器测试需要本机 Chrome/Edge，否则跳过。测试不会修改已运行桌宠的设置、启动项或 Codex 会话。实际关机重启、多显示器和真实 PRTS Special 导出仍需对应环境验证。
 
 v2 素材格式说明见 [manifest 参考](ark-codex-skill/references/manifest.md)。
 
