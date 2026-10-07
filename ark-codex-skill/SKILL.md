@@ -25,7 +25,7 @@ The runtime uses only PySide6-Essentials in `.venv`. Export/conversion tools use
 
 ## Export and import
 
-Resolve the exact PRTS operator page and choose the requested skin and 基建 model group. Export Default, Interact, Move, Relax, Sit and Sleep. If automation is appropriate, the bundled exporter can be used:
+Resolve the exact PRTS operator page and choose the requested skin and 基建 model group. Export Default, Interact, Move, Relax, Sit and Sleep, plus Special when it is actually available. Absence of Special is valid; failure of an advertised/supplied Special is not silently accepted. If automation is appropriate, the bundled exporter can be used:
 
 ```powershell
 <project-dir>/.tools-venv/Scripts/python.exe scripts/prts_export.py "<operator>" --skin "<skin>" --out "<project-dir>/work/webm/<library-name>"
@@ -38,31 +38,36 @@ The exporter explicitly selects VP9 to retain real alpha and discards a first wa
 Convert and validate:
 
 ```powershell
-<project-dir>/.tools-venv/Scripts/python.exe scripts/process_webm.py --src "<project-dir>/work/webm/<library-name>" --name "<library-name>" --out "<project-dir>/pets/<library-name>"
-<project-dir>/.tools-venv/Scripts/python.exe scripts/validate_deskpet.py "<project-dir>/pets/<library-name>" --allow-inactive --out "<project-dir>/work/<library-name>-preview.png"
+<project-dir>/.tools-venv/Scripts/python.exe scripts/process_webm.py --src "<project-dir>/work/webm/<library-name>" --name "<library-name>" --out "<project-dir>/work/prepared/<library-name>"
+<project-dir>/.tools-venv/Scripts/python.exe scripts/validate_deskpet.py "<project-dir>/work/prepared/<library-name>" --allow-inactive --out "<project-dir>/work/<library-name>-preview.png"
+<project-dir>/.tools-venv/Scripts/python.exe scripts/install_deskpet.py "<project-dir>/work/prepared/<library-name>" --project "<project-dir>" --name "<library-name>"
 ```
 
 Conversion preserves native frame timestamps and alpha, crops only transparent exterior pixels and records original-canvas offsets. Do not resample new assets to the former fixed 20fps. Read [references/manifest.md](references/manifest.md) when adapting the converter or player.
 
-Relax maps to idle, Interact to interact, Move to move, Sit to sit and Sleep to sleep. Files under 1000 bytes are skipped; Default is often a broken 110-byte export and does not become a state. All five playable states are required. Duplicate state files are rejected instead of silently mixing characters.
+Relax maps to idle, Interact to interact, Move to move, Sit to sit and Sleep to sleep; optional Special maps to special. Default is often a broken 110-byte export and does not become a state. The five base states are required. Broken supplied Special files and duplicate state files are rejected instead of silently mixing characters.
 
-The converter stages a complete pet before publishing it and refuses an existing destination. To rebuild a pet, use a fresh output directory, inspect the preview and preserve the old assets before a deliberate replacement with the app stopped. If the decoded source has opaque black background, prefer a transparent re-export. Only use `--recover-black` when approximation is intended; inspect dark outlines and shadows before accepting it.
+The converter stages a complete pet and refuses an existing destination. To rebuild a pet, use a fresh prepared output and inspect the preview. The installer validates every PNG, timing and crop; it copies only manifest and frames, not source WebM or unrelated files. Same-name installation requires explicit `--replace` and retains the previous directory under pets/.backups. It requests a bounded runtime freeze before replacing active assets and refreshes caches afterward. If a finish reply is ambiguous, obtain another freeze before rollback; otherwise retain the candidate and backup and report the unresolved refresh. Never bypass a busy/unresponsive/old runtime by renaming live files. If the decoded source has opaque black background, prefer a transparent re-export. Only use `--recover-black` when approximation is intended; inspect dark outlines and shadows before accepting it.
 
-Restart the project, select the pet through the 桌宠库 menu and verify visible transparency, all five actions, scale and screen position. Initial projects retain the upstream 予愿安洁莉娜 sample, so they can launch before the requested pet is imported. If no valid pet exists, the app shows an import hint rather than failing during module import.
+After installation, select the pet through 桌宠库 (or use 刷新桌宠库); a current runtime need not restart. Older generated projects require a code upgrade and one restart first, preserving settings and pets. Verify visible transparency, available actions, scale and screen position. Initial projects retain the upstream 予愿安洁莉娜 sample. If no valid pet exists, the app shows an import hint rather than failing during module import.
 
 ## Runtime behavior
 
 - Per-pet position, scale and animation speed are remembered.
 - Subtitle width is independent of pet scale; hovering reveals full local task information.
-- Automatic rest starts after about 40–60 seconds and sleep after 90 seconds. Manual states take precedence.
+- Automatic rest starts after about 40–60 seconds and sleep after 90 seconds; it can be disabled separately. Manual states take precedence.
 - Roaming is optional and starts disabled. Walking/idle transitions blend for 140ms and retain facing; only automatic roaming idle caps long source holds at 120ms. Manual and other playback retain native timing. Roaming pauses for interaction, dragging, menus and rest.
 - The playback cap defaults to 60fps, but old 20fps assets cannot gain frames without reconversion.
-- Automatic movement keeps floating-point coordinates and compensates the native client pixel origin for DPI rounding. Pet and subtitle share a cached premultiplied layer with bilinear motion filtering. A separate screen-informed motion timer does not alter the animation frame cap or source assets; do not claim strict vertical synchronization.
+- Roaming settings expose activity frequency, walk probability, maximum distance and pause bounds. Activity frequency changes real-time pauses, not animation speed. Optional stationary diversions play 1–3 complete cycles; only actual walking changes position.
+- 全部动作（播放一次） lists real manifest states, including optional Special. Manual one-shots restore the preceding manual state or idle; Move preview is stationary. Do not create fake Special frames from Interact.
+- Automatic movement keeps floating-point coordinates and compensates the native client pixel origin for DPI rounding. Pet and subtitle share a cached premultiplied layer. Apply bilinear filtering only during actual autonomous translation; stationary presentation rounds its display offset to physical pixels, without changing world coordinates or saved anchors. A Move preview is not translation. A separate screen-informed motion timer does not alter the animation cap or source assets; do not claim strict vertical synchronization.
 - The Codex monitor reads rollout logs under CODEX_HOME/sessions or the default ~/.codex/sessions; it does not change Codex data.
 - Autostart is optional and starts disabled. Only enable it or create shortcuts when requested. The watcher shows the pet and tray while Codex/ChatGPT is running, with project-scoped single-instance guards and crash backoff.
 - Tray Exit ends normal supervision; do not bypass a user's deliberate hide or exit choice.
 
-When changing the template, run `tests/test_deskpet.py` with the runtime environment and `tests/test_pipeline.py` with the tools environment. Tests use isolated generated fixtures, not personal operator assets. Do not launch a second watcher or register test startup entries.
+When changing the template, run `tests/test_deskpet.py` with the runtime environment and `tests/test_pipeline.py` plus `tests/test_extensions.py` with the tools environment. Tests use isolated generated fixtures, not personal operator assets. Do not launch a second watcher or register test startup entries.
+
+For source candidate packaging, `scripts/build_release.py --out <new-directory-outside-repo>` emits an allowlisted ZIP and SHA-256 checksums; it does not publish. The repository's docs/release.md explains upgrade and release boundaries. Obtain user authorization before pushing, tagging, or creating GitHub Releases; local implementation requests alone do not imply those external actions.
 
 ## Source and sharing
 
