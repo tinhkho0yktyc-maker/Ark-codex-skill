@@ -709,18 +709,26 @@ class PetWindow(QWidget):
     def note_activity(self):
         self.last_activity = time.monotonic()
         self.auto_sit_after = random.uniform(40, 60)
-        self.manual_state = False
-        self.auto_action_end = None
-        self.one_shot_return = None
+        # Activity resets rest/roaming clocks, not the current action's exit.
+        # Clearing a deadline here would orphan an automatic held animation.
+        if self.one_shot_return is None:
+            self.manual_state = False
         self.next_roam_at = self.last_activity + behavior_support.pause_seconds(self.settings)
+
+    def temporary_action_return(self):
+        """Stable state to restore when cancelling/replacing a finite action."""
+        if self.one_shot_return is not None:
+            return self.one_shot_return
+        if self.auto_action_end is not None:
+            return ("idle", False, False)
+        return None
 
     def set_state(self, name, hold=False, manual=False):
         if name not in MANIFEST["states"]:
             return
+        # Completion bookkeeping belongs only to the animation being replaced.
         self.auto_action_end = None
-        if manual:
-            self.one_shot_return = None
-            self.auto_action_end = None
+        self.one_shot_return = None
         now = time.monotonic()
         self.transition_image = None
         if (self.roaming_enabled and not manual and not self.manual_state
@@ -1016,6 +1024,9 @@ class PetWindow(QWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.stop_roaming()
+            previous = self.temporary_action_return()
+            if previous is not None:
+                self.set_state(*previous)
             self.pre_drag_manual = self.manual_state
             self.note_activity()
             self.drag = False
@@ -1183,7 +1194,9 @@ class PetWindow(QWidget):
     def play_action(self, name):
         if name not in MANIFEST["states"] or self.library_paused:
             return
-        previous = (self.state, self.hold_state, self.manual_state) if self.manual_state else ("idle", False, False)
+        previous = self.temporary_action_return()
+        if previous is None:
+            previous = (self.state, self.hold_state, self.manual_state) if self.manual_state else ("idle", False, False)
         self.stop_roaming()
         self.note_activity()
         self.set_state(name, hold=True, manual=True)
@@ -1234,7 +1247,7 @@ class PetWindow(QWidget):
     def reload_active_pet(self):
         if not switch_pet(self.pet_name):
             raise ValueError("Current pet is absent or invalid; keeping the existing image")
-        previous = (self.state, self.hold_state, self.manual_state)
+        previous = self.temporary_action_return() or (self.state, self.hold_state, self.manual_state)
         self.stop_roaming()
         self.cache.clear()
         self.cache_bytes = 0
