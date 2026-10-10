@@ -21,7 +21,7 @@ sys.path.insert(0, str(PROJECT))
 import codex_monitor as monitor
 import process_support as support
 import main as pet
-from PySide6.QtCore import QThread, QRect, Signal, Qt
+from PySide6.QtCore import QPointF, QThread, QRect, Signal, Qt
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
@@ -558,6 +558,141 @@ class WindowTests(unittest.TestCase):
         with patch.object(pet.time, "monotonic", lambda: completed_at):
             w.next_frame()
         self.assertEqual(w.state, "idle")
+
+    def start_automatic_interaction(self):
+        w = self.window
+        w.settings["auto_rest_enabled"] = False
+        with patch.object(pet.time, "monotonic", lambda: 100), \
+                patch.object(pet.behavior_support, "choose_action", lambda *args: "interact"), \
+                patch.object(pet.random, "randint", lambda *args: 3):
+            w.set_state("idle")
+            w.note_activity()
+            w.roaming_enabled = True
+            w.next_roam_at = 100
+            w.step_roaming(100, 0)
+        self.assertEqual(w.state, "interact")
+        self.assertTrue(w.hold_state)
+        self.assertIsNotNone(w.auto_action_end)
+        return w.auto_action_end
+
+    @staticmethod
+    def mouse_event(x, y, buttons=Qt.LeftButton):
+        return types.SimpleNamespace(
+            button=lambda: Qt.LeftButton,
+            buttons=lambda: buttons,
+            globalPosition=lambda: QPointF(x, y),
+            position=lambda: QPointF(0, 0),
+        )
+
+    def test_new_task_preserves_automatic_interaction_deadline(self):
+        w = self.window
+        deadline = self.start_automatic_interaction()
+        with patch.object(pet.time, "monotonic", lambda: 100.5):
+            w.receive_status({"active": True, "task": "新任务"})
+        self.assertEqual(w.state, "interact")
+        self.assertEqual(w.auto_action_end, deadline)
+        with patch.object(pet.time, "monotonic", lambda: deadline + 0.001):
+            w.next_frame()
+        self.assertEqual(w.state, "idle")
+        self.assertFalse(w.hold_state)
+        self.assertIsNone(w.auto_action_end)
+        self.assertGreater(w.next_roam_at, deadline)
+
+    def test_long_press_cancels_automatic_interaction_without_orphaning_hold(self):
+        w = self.window
+        self.start_automatic_interaction()
+        with patch.object(pet.time, "monotonic", lambda: 100.5):
+            w.mousePressEvent(self.mouse_event(100, 100))
+        with patch.object(pet.time, "monotonic", lambda: 101.2):
+            w.mouseReleaseEvent(self.mouse_event(100, 100))
+        self.assertEqual(w.state, "idle")
+        self.assertFalse(w.hold_state)
+        self.assertIsNone(w.auto_action_end)
+
+    def test_drag_never_restores_an_unbounded_automatic_interaction(self):
+        w = self.window
+        for lost_button in (False, True):
+            with self.subTest(lost_button=lost_button):
+                self.start_automatic_interaction()
+                with patch.object(pet.time, "monotonic", lambda: 100.5):
+                    w.mousePressEvent(self.mouse_event(100, 100))
+                with patch.object(pet.time, "monotonic", lambda: 100.6):
+                    w.mouseMoveEvent(self.mouse_event(120, 100))
+                self.assertTrue(w.drag)
+                with patch.object(pet.time, "monotonic", lambda: 100.7):
+                    if lost_button:
+                        w.mouseMoveEvent(self.mouse_event(120, 100, Qt.NoButton))
+                    else:
+                        w.mouseReleaseEvent(self.mouse_event(120, 100))
+                self.assertEqual(w.state, "idle")
+                self.assertFalse(w.hold_state)
+                self.assertFalse(w.drag)
+
+    def test_nested_one_shots_restore_original_manual_state(self):
+        w = self.window
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.set_state("sleep", hold=True, manual=True)
+            w.play_action("interact")
+        with patch.object(pet.time, "monotonic", lambda: 100.5):
+            w.play_action("move")
+        with patch.object(pet.time, "monotonic", lambda: 107):
+            w.next_frame()
+        self.assertEqual(w.state, "sleep")
+        self.assertTrue(w.manual_state)
+        self.assertIsNone(w.one_shot_return)
+
+    def test_state_change_discards_old_one_shot_completion(self):
+        w = self.window
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.play_action("interact")
+            w.set_state("sleep", hold=True)
+        self.assertIsNone(w.one_shot_return)
+        with patch.object(pet.time, "monotonic", lambda: 107):
+            w.next_frame()
+        self.assertEqual(w.state, "sleep")
+
+    def test_reload_cancels_bounded_automatic_interaction(self):
+        w = self.window
+        self.start_automatic_interaction()
+        with patch.object(pet.time, "monotonic", lambda: 100.5):
+            w.refresh_library()
+        self.assertEqual(w.state, "idle")
+        self.assertFalse(w.hold_state)
+        self.assertIsNone(w.auto_action_end)
+
+    def test_reload_one_shot_restores_original_manual_state(self):
+        w = self.window
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.set_state("sleep", hold=True, manual=True)
+            w.play_action("interact")
+            w.refresh_library()
+        self.assertEqual(w.state, "sleep")
+        self.assertTrue(w.manual_state)
+        self.assertIsNone(w.one_shot_return)
+
+    def test_drag_during_preview_restores_original_manual_state(self):
+        w = self.window
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.set_state("sleep", hold=True, manual=True)
+            w.play_action("interact")
+            w.mousePressEvent(self.mouse_event(100, 100))
+            w.mouseMoveEvent(self.mouse_event(120, 100))
+            w.mouseReleaseEvent(self.mouse_event(120, 100))
+        self.assertEqual(w.state, "sleep")
+        self.assertTrue(w.manual_state)
+        self.assertIsNone(w.one_shot_return)
+
+    def test_task_during_manual_preview_keeps_its_one_shot_return(self):
+        w = self.window
+        with patch.object(pet.time, "monotonic", lambda: 100):
+            w.set_state("sleep", hold=True, manual=True)
+            w.play_action("interact")
+            w.receive_status({"active": True})
+        self.assertEqual(w.one_shot_return, ("sleep", True, True))
+        with patch.object(pet.time, "monotonic", lambda: 107):
+            w.next_frame()
+        self.assertEqual(w.state, "sleep")
+        self.assertTrue(w.manual_state)
 
     def test_tiny_screen_and_large_action_remain_inside(self):
         w = self.window
